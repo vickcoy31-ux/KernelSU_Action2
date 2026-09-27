@@ -107,6 +107,16 @@ prepare_defconfig() {
 		info "CMDQ: kept only cmdq-platform-mt6789.o (GTA9=MT6789)"
 	fi
 
+	# 4. MDP (MediaTek DataPath): same wildcard pattern — mdp_drv_mt6893.o
+	#    plus mdp_drv_mt6879.o collide on cmdq_mdp_* symbols (run #54). Keep
+	#    only the MT6789 one for GTA9.
+	local mdp_mk="${KERNEL_DIR}/drivers/misc/mediatek/mdp/Makefile"
+	if [ -f "$mdp_mk" ]; then
+		sed -i -E '/obj-\$\(CONFIG_MTK_MDP\) \+= mdp_drv_mt[0-9]+\.o$/ {/mdp_drv_mt6789\.o$/!d}' "$mdp_mk"
+		sed -i -E '/mdp_drv_mt[0-9]+-objs := mdp_drv\.o mdp_mt[0-9]+\.o$/ {/mdp_drv_mt6789-objs/!d}' "$mdp_mk"
+		info "MDP: kept only mdp_drv_mt6789.o (GTA9=MT6789)"
+	fi
+
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
