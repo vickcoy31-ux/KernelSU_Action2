@@ -138,6 +138,29 @@ prepare_defconfig() {
 		sed -i 's/\blarb2\b/larb2_mdp/g' "$mdp6789"
 		info "MDP6789: renamed larb2 -> larb2_mdp"
 	fi
+	# 7. Lens VCM driver (run #57): DW9763AF.c defines 'u8 read_data(u8 addr)'
+	#    which collides with cam_cal's read_data(). DW9763AF.h does NOT declare
+	#    it and no other file calls it -> make the lens VCM copy static.
+	local dw9763af="${KERNEL_DIR}/drivers/misc/mediatek/lens/vcm/proprietary/main/common/dw9763af/DW9763AF.c"
+	if [ -f "$dw9763af" ] && grep -q "u8 read_data(u8 addr)" "$dw9763af"; then
+		sed -i 's/u8 read_data(u8 addr)/static u8 read_data(u8 addr)/' "$dw9763af"
+		info "DW9763AF: made read_data static"
+	fi
+
+	# 8. Thermal/power (run #57): mtk_cm_mgr_common.c and mtk_pbm.c both define
+	#    a global 'void tracepoint_cleanup(void)'. Verified by git grep: the
+	#    only references are inside each own file, so make both static.
+	local pbm_c="${KERNEL_DIR}/drivers/misc/mediatek/pbm/mtk_pbm.c"
+	if [ -f "$pbm_c" ] && grep -q "void tracepoint_cleanup(void)" "$pbm_c"; then
+		sed -i 's/^void tracepoint_cleanup(void)/static void tracepoint_cleanup(void)/' "$pbm_c"
+		info "PBM: made tracepoint_cleanup static"
+	fi
+	local cm_c="${KERNEL_DIR}/drivers/misc/mediatek/cm_mgr/mtk_cm_mgr_common.c"
+	if [ -f "$cm_c" ] && grep -q "void tracepoint_cleanup(void)" "$cm_c"; then
+		sed -i 's/^void tracepoint_cleanup(void)/static void tracepoint_cleanup(void)/' "$cm_c"
+		info "CM_MGR: made tracepoint_cleanup static"
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
