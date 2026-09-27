@@ -117,6 +117,28 @@ prepare_defconfig() {
 		info "MDP: kept only mdp_drv_mt6789.o (GTA9=MT6789)"
 	fi
 
+	# 5. IMGSENSOR frame-sync (run #55/#56): the legacy src/ tree builds its
+	#    own frame_monitor.o + frame_sync_algo.o via
+	#    src/common/v1_1/n3d_fsync/Makefile, and src-v4l2/frame-sync builds the
+	#    same-named objects again -> every frm_*/fs_*/FrameSync* symbol collides
+	#    under lld. GTA9 uses the v4l2 path, so drop the n3d_fsync include from
+	#    src/isp6s/Makefile; the rest of the legacy imgsensor tree stays intact.
+	local n3d_mk="${KERNEL_DIR}/drivers/misc/mediatek/imgsensor/src/isp6s/Makefile"
+	if [ -f "$n3d_mk" ] && grep -q "n3d_fsync/Makefile" "$n3d_mk"; then
+		sed -i -E '\#include .*n3d_fsync/Makefile#d' "$n3d_mk"
+		info "IMGSENSOR: dropped n3d_fsync frame-sync include (GTA9 uses src-v4l2)"
+	fi
+
+	# 6. MDP MT6789: its file-global 'struct device *larb2' collides with the
+	#    same symbol in camera_pda.o (run #55/#56). It is only used inside
+	#    mdp_mt6789.c, so rename it (like g_core_mask_table_dcs).
+	local mdp6789="${KERNEL_DIR}/drivers/misc/mediatek/mdp/mdp_mt6789.c"
+	if [ -f "$mdp6789" ] && grep -q "struct device \*larb2;" "$mdp6789"; then
+		sed -i 's/struct device \*larb2;/struct device *larb2_mdp;/' "$mdp6789"
+		sed -i 's/\blarb2\b/larb2_mdp/g' "$mdp6789"
+		info "MDP6789: renamed larb2 -> larb2_mdp"
+	fi
+
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
