@@ -45,6 +45,19 @@ prepare_defconfig() {
 		kconf_enable "$DEFCONFIG_PATH" CONFIG_KSU
 		ksu_hook_configs "${KSU_VARIANT}" "${KSU_HOOK_MODE:-auto}" "$DEFCONFIG_PATH" "$kver"
 
+		# ReSukiSU (and its SukiSU family) ships kernel/tools/static_export_check.mk
+		# which FAILS the build while the selinux_hide symbols stay 'static' in
+		# this tree. The check treats a present "static ..." literal as "not
+		# exported" and errors with "You should integrate ReSukiSU in your
+		# kernel". GTA9's selinuxfs.c keeps sel_handle_status_ops static, so drop
+		# the 'static' qualifier so the symbol becomes globally visible and the
+		# check passes. Matches the weishu upstream integration, idempotent.
+		local selinuxfs="${KERNEL_DIR}/security/selinux/selinuxfs.c"
+		if [ -f "$selinuxfs" ] && grep -q "static const struct file_operations sel_handle_status_ops" "$selinuxfs"; then
+			sed -i 's/static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' "$selinuxfs"
+			info "unstatic'd sel_handle_status_ops for ReSukiSU static-export check"
+		fi
+
 		if is_true "${ENABLE_SUSFS:-false}"; then
 			susfs_defconfig "$DEFCONFIG_PATH"
 		fi
