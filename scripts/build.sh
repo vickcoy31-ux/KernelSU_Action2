@@ -76,14 +76,16 @@ prepare_defconfig() {
 	# only meant to exist in ONE variant collide as "duplicate symbol". GTA9 is
 	# MT6789, so drop non-MT6789 objects and make the collisions go away.
 	#
-	# 1. Camera PDA (isp_71): the generic camera_pda.c matches
-	#    "mediatek,camera-pda" on MT6789; mt6879/mt6895 are other SoCs. The
-	#    pda/Makefile links all three because all files exist in this tree.
+	# 1. Camera PDA (isp_71): the pda/Makefile wildcard-gates every SoC —
+	#    isp_71/camera_pda.o (generic, MT6789) plus pda_drv_mt6879/mt6895
+	#    (isp_71 other SoCs) and pda_drv_mt6855 (which pulls in
+	#    isp_6s/camera_pda.o — a DIFFERENT .c with the same name and same
+	#    globals). All collide under lld. Keep only the MT6789 generic object.
 	local pda_mk="${KERNEL_DIR}/drivers/misc/mediatek/cameraisp/pda/Makefile"
 	if [ -f "$pda_mk" ]; then
-		sed -i -E '/obj-\$\(CONFIG_MTK_CAMERA_ISP_PDA_SUPPORT\) \+= pda_drv_mt(6879|6895)\.o/d' "$pda_mk"
-		sed -i -E '/pda_drv_mt(6879|6895)-objs/d' "$pda_mk"
-		info "PDA: dropped mt6879/mt6895 platform objects (GTA9=MT6789)"
+		sed -i -E '/obj-\$\(CONFIG_MTK_CAMERA_ISP_PDA_SUPPORT\) \+= pda_drv_mt(6879|6895|6855)\.o/d' "$pda_mk"
+		sed -i -E '/pda_drv_mt(6879|6895|6855)-objs/d' "$pda_mk"
+		info "PDA: dropped non-MT6789 platform objects (GTA9=MT6789)"
 	fi
 
 	# 2. GPU DCS: g_core_mask_table is a file-global in ged_dcs.c (also used by
@@ -94,6 +96,15 @@ prepare_defconfig() {
 		sed -i 's/struct gpufreq_core_mask_info \*g_core_mask_table;/struct gpufreq_core_mask_info *g_core_mask_table_dcs;/' "$ged_dcs"
 		sed -i 's/\bg_core_mask_table\b/g_core_mask_table_dcs/g' "$ged_dcs"
 		info "GPU DCS: renamed g_core_mask_table -> g_core_mask_table_dcs"
+	fi
+
+	# 3. CMDQ mailbox: wildcard-gates every cmdq-platform-mtNNNN.o; two of
+	#    them (e.g. mt6833 vs mt6893) collide on exported symbols. Keep only
+	#    the MT6789 one for GTA9.
+	local cmdq_mk="${KERNEL_DIR}/drivers/misc/mediatek/cmdq/mailbox/Makefile"
+	if [ -f "$cmdq_mk" ]; then
+		sed -i -E '/obj-\$\(CONFIG_MTK_CMDQ_MBOX_EXT\) \+= cmdq-platform-mt[0-9]+\.o$/ {/cmdq-platform-mt6789\.o$/!d}' "$cmdq_mk"
+		info "CMDQ: kept only cmdq-platform-mt6789.o (GTA9=MT6789)"
 	fi
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
