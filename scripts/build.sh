@@ -69,6 +69,33 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# Vendor trees routinely ship multi-platform .c files behind 'obj-y' even
+	# when the driver is '=m' (see drivers/gpu/mediatek/Makefile) or gate every
+	# SoC variant on wildcard presence instead of the platform's config. When
+	# LLVM's lld links all built-in objects together, global symbols that are
+	# only meant to exist in ONE variant collide as "duplicate symbol". GTA9 is
+	# MT6789, so drop non-MT6789 objects and make the collisions go away.
+	#
+	# 1. Camera PDA (isp_71): the generic camera_pda.c matches
+	#    "mediatek,camera-pda" on MT6789; mt6879/mt6895 are other SoCs. The
+	#    pda/Makefile links all three because all files exist in this tree.
+	local pda_mk="${KERNEL_DIR}/drivers/misc/mediatek/cameraisp/pda/Makefile"
+	if [ -f "$pda_mk" ]; then
+		sed -i -E '/obj-\$\(CONFIG_MTK_CAMERA_ISP_PDA_SUPPORT\) \+= pda_drv_mt(6879|6895)\.o/d' "$pda_mk"
+		sed -i -E '/pda_drv_mt(6879|6895)-objs/d' "$pda_mk"
+		info "PDA: dropped mt6879/mt6895 platform objects (GTA9=MT6789)"
+	fi
+
+	# 2. GPU DCS: g_core_mask_table is a file-global in ged_dcs.c (also used by
+	#    the gpufreq getter in gpufreq_mt6789.c). Keep ged's copy but rename it
+	#    so the two built-in objects no longer collide.
+	local ged_dcs="${KERNEL_DIR}/drivers/gpu/mediatek/ged/src/ged_dcs.c"
+	if [ -f "$ged_dcs" ] && grep -q "struct gpufreq_core_mask_info \*g_core_mask_table;" "$ged_dcs"; then
+		sed -i 's/struct gpufreq_core_mask_info \*g_core_mask_table;/struct gpufreq_core_mask_info *g_core_mask_table_dcs;/' "$ged_dcs"
+		sed -i 's/\bg_core_mask_table\b/g_core_mask_table_dcs/g' "$ged_dcs"
+		info "GPU DCS: renamed g_core_mask_table -> g_core_mask_table_dcs"
+	fi
+
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
