@@ -367,24 +367,36 @@ prepare_defconfig() {
 		fi
 	fi
 
-	# 15. ged tracepoint collides with an upstream event (run #72).
+	# 15. ged tracepoint collides with an upstream event (run #72; CORRECTED in #80).
 	#     drivers/gpu/mediatek/ged/include/ged_tracepoint.h declares
 	#         TRACE_EVENT(tracing_mark_write, ...)
-	#     but tracing_mark_write is ALSO declared upstream in
-	#     kernel/trace/trace_tracing_mark_write.c. TRACE_SYSTEM does not appear
-	#     in the symbol a TRACE_EVENT generates -- the name is always
-	#     __tracepoint_<event> -- and TRACE_INCLUDE_FILE only names the
-	#     generated *file*, not the symbol. So ged_log.o and
-	#     kernel/built-in.a both emit __tracepoint_tracing_mark_write:
+	#     but tracing_mark_write is ALSO declared upstream, in this tree in
+	#     include/trace/events/tracing_mark_write.h compiled by
+	#     kernel/trace/trace_tracing_mark_write.c. (MTK split it out of the
+	#     upstream 5.10 location in trace_printk.c; sched.h here has no such
+	#     event.) TRACE_SYSTEM does not appear in the symbol a TRACE_EVENT
+	#     generates -- the name is always __tracepoint_<event> -- and
+	#     TRACE_INCLUDE_FILE only names the generated *file*, not the symbol. So
+	#     ged_log.o and kernel/built-in.a both emitted
+	#     __tracepoint_tracing_mark_write:
 	#         ld.lld: error: duplicate symbol: __tracepoint_tracing_mark_write
 	#         >>> defined at trace_tracing_mark_write.c  kernel/built-in.a
 	#         >>> defined at ged_log.c                   drivers/built-in.a
 	#     and likewise __traceiter_ and __SCK__tp_func_ for the same event.
-	#     ged_log.c only includes the header and never calls the tracepoint, so
-	#     renaming the event needs no call-site change and no behaviour change.
 	#     This became visible in #72 only because run #68 turned on
 	#     ENABLE_DEFAULT_TRACERS, which for the first time made CONFIG_TRACEPOINTS
 	#     resolve to y and pulled kernel/trace/ into the build at all.
+	#
+	#     CORRECTION: the original comment here claimed "ged_log.c only includes
+	#     the header and never calls the tracepoint, so renaming the event needs
+	#     no call-site change". That was wrong, and run #79 paid for it --
+	#     ld.lld: undefined symbol: trace_tracing_mark_write, referenced by
+	#     ged_kpi.c and ged_eb.c. Four ged .c files do call it, 11 sites in
+	#     total, and -Wno-error=implicit-function-declaration in KCFLAGS let
+	#     every one of them through compile as an implicit declaration. The
+	#     event is NOT a Kconfig problem: CONFIG_EVENT_TRACING=y already builds
+	#     the provider, so there is nothing to configure. Both halves are needed
+	#     and both are done here.
 	local ged_tp="${KERNEL_DIR}/drivers/gpu/mediatek/ged/include/ged_tracepoint.h"
 	if [ -f "$ged_tp" ] && grep -q '^TRACE_EVENT(tracing_mark_write,$' "$ged_tp"; then
 		sed -i 's/^TRACE_EVENT(tracing_mark_write,$/TRACE_EVENT(ged_tracing_mark_write,/' "$ged_tp"
@@ -393,6 +405,24 @@ prepare_defconfig() {
 		else
 			warn "GED_TRACEPOINT: rename did not verify"
 		fi
+	fi
+	# Step 2, added in #80: the call sites. \b keeps this from touching the
+	# upstream tracing_mark_begin/tracing_mark_end macros, which are macros and
+	# therefore never appear as a literal call -- so only the ged driver's own
+	# direct calls are rewritten.
+	local ged_src f changed=0
+	for ged_src in ged_kpi.c ged_dvfs.c ged_eb.c ged_notify_sw_vsync.c; do
+		f="${KERNEL_DIR}/drivers/gpu/mediatek/ged/src/${ged_src}"
+		[ -f "$f" ] || continue
+		if grep -q '\btrace_tracing_mark_write(' "$f"; then
+			sed -i 's/\btrace_tracing_mark_write(/trace_ged_tracing_mark_write(/g' "$f"
+			changed=$((changed + 1))
+		fi
+	done
+	if [ "$changed" -gt 0 ]; then
+		info "GED_TRACEPOINT: rewrote the call sites in ${changed} ged source file(s)"
+	else
+		info "GED_TRACEPOINT: no ged call sites needed rewriting"
 	fi
 
 	# 16. mtk_pm_qos_update_request declared in two regulator drivers (run #73).
@@ -438,19 +468,38 @@ prepare_defconfig() {
 	#     Both are dumped below so the next run settles it with evidence.
 	local vmm_tp="${KERNEL_DIR}/drivers/regulator/mtk-vmm-trace.h"
 	if [ -f "$vmm_tp" ] && grep -q '^DECLARE_EVENT_CLASS(mtk_pm_qos_request,$' "$vmm_tp"; then
-		# Lines 15..44 are the pasted block. Re-derive rather than hardcode: the
-		# class ends where its DEFINE_EVENT closes, which is what the next
-		# TRACE_EVENT must follow.
-		local vmm_start vmm_end
-		vmm_start=$(grep -n '^DECLARE_EVENT_CLASS(mtk_pm_qos_request,$' "$vmm_tp" | head -n1 | cut -d: -f1)
-		vmm_end=$(awk -v s="$vmm_start" '
-			NR > s && /^TRACE_EVENT\(/ { print NR; exit }' "$vmm_tp")
-		[ -n "$vmm_end" ] || die "could not locate the end of the pasted block in ${vmm_tp}"
-		sed -i "${vmm_start},$((vmm_end - 1))d" "$vmm_tp"
+		# CORRECTED in #80. This used to delete the pasted block outright:
+		#     sed -i "${vmm_start},$((vmm_end - 1))d" "$vmm_tp"
+		# That cleared the duplicate, which is what run #76 verified, but it left
+		# the call site in mtk-vmm-regulator.c:248 with nothing to resolve to:
+		#     ld.lld: error: undefined symbol: trace_mtk_pm_qos_update_request
+		#     >>> referenced by mtk-vmm-regulator.c  regulator/built-in.a
+		#                             (ccu_set_voltage)
+		# KCFLAGS carries -Wno-error=implicit-function-declaration, so the call
+		# compiled happily as an implicit declaration and only failed at link.
+		# BUILD_HISTORY §4b already suspected this call was a silent no-op; run
+		# #79 proved it was worse than that.
+		#
+		# The right cut is to rename, not delete. The vmm regulator wants to
+		# trace its own PM QoS request; the reason it collided with dvfsrc is
+		# only that both picked the same event name. Give it a vmm-specific one
+		# and the trace works again -- same approach as patch 15.
+		sed -i 's/^DECLARE_EVENT_CLASS(mtk_pm_qos_request,$/DECLARE_EVENT_CLASS(mtk_vmm_pm_qos_request,/' "$vmm_tp"
+		sed -i 's/^DEFINE_EVENT(mtk_pm_qos_request, mtk_pm_qos_update_request,$/DEFINE_EVENT(mtk_vmm_pm_qos_request, mtk_vmm_pm_qos_update_request,/' "$vmm_tp"
 		if grep -q 'mtk_pm_qos_request' "$vmm_tp"; then
-			warn "REGULATOR_TRACE: mtk_pm_qos_request still present after removal"
+			warn "REGULATOR_TRACE: old event name still present in mtk-vmm-trace.h after rename"
 		else
-			info "REGULATOR_TRACE: removed the copied DECLARE_EVENT_CLASS/DEFINE_EVENT from mtk-vmm-trace.h"
+			info "REGULATOR_TRACE: renamed the vmm copy to mtk_vmm_pm_qos_request (was colliding with dvfsrc)"
+		fi
+		# The call site, which no Kconfig change and no header edit can fix.
+		local vmm_c_call="${KERNEL_DIR}/drivers/regulator/mtk-vmm-regulator.c"
+		if [ -f "$vmm_c_call" ] && grep -q '\btrace_mtk_pm_qos_update_request(' "$vmm_c_call"; then
+			sed -i 's/\btrace_mtk_pm_qos_update_request(/trace_mtk_vmm_pm_qos_update_request(/g' "$vmm_c_call"
+			if grep -q '\btrace_mtk_pm_qos_update_request(' "$vmm_c_call"; then
+				warn "REGULATOR_TRACE: old call name still present in mtk-vmm-regulator.c"
+			else
+				info "REGULATOR_TRACE: call site now uses trace_mtk_vmm_pm_qos_update_request"
+			fi
 		fi
 	fi
 
@@ -533,6 +582,61 @@ prepare_defconfig() {
 		grep -q '^obj-y += common/$' "$mtk_soc_mk" || printf '\nobj-y += common/\n' >>"$mtk_soc_mk"
 		sed -i -E 's#^obj-m \+= mtk-afe-external\.o$#obj-y += mtk-afe-external.o#' "$afe_mk"
 		info "AFE: built mtk-afe-external.o into vmlinux (was obj-m, dead with MODULES=n)"
+	fi
+
+	# 19. gpueb is hung off obj-m (run #79). drivers/gpu/mediatek/gpueb/Makefile:
+	#         obj-m += gpueb.o
+	#     CONFIG_MODULES is n in this tree, so scripts/Makefile.build discards
+	#     obj-m outright and not one of the nine objects is compiled -- the log
+	#     shows `AR drivers/gpu/mediatek/gpueb/built-in.a` with no `CC` for any
+	#     of them. Eight symbols go missing, referenced from 20+ places across
+	#     gpufreq_v2.c and ged_eb.c:
+	#         get_gpueb_ipidev, gpueb_dump_status, gpueb_trigger_wdt,
+	#         gpueb_get_{recv,send}_PIN_ID_by_name,
+	#         gpueb_get_reserve_mem_{phys,virt,size}_by_name
+	#     There is no Kconfig value that helps: CONFIG_MTK_TINYSYS_GPUEB_SUPPORT
+	#     exists, defaults to n, and is referenced by nothing at all. Same
+	#     treatment as patch 17 -- obj-m becomes obj-y. Disabling the consumer
+	#     is not an option, it is the GPU driver itself.
+	local gpueb_mk="${KERNEL_DIR}/drivers/gpu/mediatek/gpueb/Makefile"
+	if [ -f "$gpueb_mk" ] && grep -q '^obj-m += gpueb\.o$' "$gpueb_mk"; then
+		sed -i 's/^obj-m += gpueb\.o$/obj-y += gpueb.o/' "$gpueb_mk"
+		if grep -q '^obj-y += gpueb\.o$' "$gpueb_mk"; then
+			info "GPUEB: built into vmlinux (was obj-m, dead with MODULES=n)"
+		else
+			warn "GPUEB: obj-m -> obj-y did not verify"
+		fi
+	fi
+
+	# 20. Secure CMDQ is gated on a make-level `ifeq ...,m` (run #79).
+	#     drivers/misc/mediatek/cmdq/mailbox/Makefile guards the three objects
+	#     that provide every cmdq_sec_* symbol with:
+	#         ifeq ($(CONFIG_MTK_GZ_TZ_SYSTEM),m)
+	#     CONFIG_MTK_GZ_TZ_SYSTEM is `m` in both defconfigs, so that is what the
+	#     author wrote -- but with CONFIG_MODULES=n every `m` is transposed to
+	#     `y` in include/config/auto.conf, the comparison goes false, and
+	#     cmdq-sec-drv.o is added to no obj at all. Seven symbols then go missing
+	#     from camera_fdvt.o: cmdq_sec_mbox_{enable,disable} and
+	#     cmdq_sec_pkt_{set_data,set_mtee,set_secid,set_payload,write_reg}.
+	#
+	#     This is the same m->y trap as everywhere else, but a Kconfig edit
+	#     cannot reach it: `ifeq` compares against a literal, while obj-$(CONFIG_X)
+	#     only ever tests y/n and so survives transposition. Changing the guard
+	#     to `ifneq ($(CONFIG_MTK_GZ_TZ_SYSTEM),)` tests "not off" instead of
+	#     "exactly m", which is what a y/n world needs.
+	#
+	#     The consumer cannot be dropped instead: camera_fdvt.c:196 #defines
+	#     FDVT_USE_GCE unconditionally, outside any #if, and the secure path is
+	#     reached from FDVT_open/FDVT_release with only a NULL check. There is
+	#     no config switch that turns it off in that file.
+	local cmdq_mk="${KERNEL_DIR}/drivers/misc/mediatek/cmdq/mailbox/Makefile"
+	if [ -f "$cmdq_mk" ] && grep -q 'ifeq ($(CONFIG_MTK_GZ_TZ_SYSTEM),m)' "$cmdq_mk"; then
+		sed -i 's|ifeq ($(CONFIG_MTK_GZ_TZ_SYSTEM),m)|ifneq ($(CONFIG_MTK_GZ_TZ_SYSTEM),)|' "$cmdq_mk"
+		if grep -q 'ifneq ($(CONFIG_MTK_GZ_TZ_SYSTEM),)' "$cmdq_mk"; then
+			info "CMDQ: secure mailbox guard now accepts y (m is transposed to y here)"
+		else
+			warn "CMDQ: guard rewrite did not verify"
+		fi
 	fi
 
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
