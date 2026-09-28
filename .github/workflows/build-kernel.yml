@@ -188,6 +188,42 @@ jobs:
       - name: Build kernel
         run: bash scripts/build.sh all
 
+      # Diagnostic only, no effect on the build result. The defconfig this
+      # profile builds from is a trimmed copy of the vendor one, so whole
+      # subsystems (USB above all) are simply absent from it and their Kconfig
+      # symbols fall back to "no default" = n. Print what the build actually
+      # resolved so a link failure can be diagnosed from a single run instead of
+      # being guessed at from the defconfig.
+      - name: Report resolved kernel config
+        if: always()
+        run: |
+          cfg=kernel_workspace/android-kernel/out/.config
+          if [ ! -f "$cfg" ]; then
+            echo "no .config was produced"
+            exit 0
+          fi
+          echo "::group::Resolved config highlights"
+          for sym in CONFIG_MODULES CONFIG_TRIM_UNUSED_KSYMS \
+                     CONFIG_USB_SUPPORT CONFIG_USB CONFIG_USB_OTG CONFIG_USB_GADGET \
+                     CONFIG_SEC_DEBUG CONFIG_SEC_EXT CONFIG_SEC_MISC CONFIG_SEC_CHIPID \
+                     CONFIG_SEC_BOOTSTAT CONFIG_SEC_DEVICE_INFO \
+                     CONFIG_IIO CONFIG_MEDIATEK_MT6577_AUXADC \
+                     CONFIG_GAUGE_MT6375 CONFIG_MTK_BATTERY \
+                     CONFIG_MTK_CCU CONFIG_MTK_CCU_RPROC CONFIG_MTK_VMM_DBG \
+                     CONFIG_MTK_CAMERA_MEM_SUPPORT CONFIG_MTK_WIDEVINE_DRM; do
+            line=$(grep -m1 -E "^${sym}(=| is not set)" "$cfg" || true)
+            printf '%-40s %s\n' "$sym" "${line:-<absent>}"
+          done
+          echo "::endgroup::"
+
+      - name: Upload resolved kernel config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/android-kernel/out/.config
+          if-no-files-found: warn
+
       - name: Package artifacts
         run: bash scripts/package.sh all
 
