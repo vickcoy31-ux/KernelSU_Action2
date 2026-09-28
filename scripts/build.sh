@@ -685,6 +685,54 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 22. task_is_booster has no definition anywhere in this tree (run #81).
+	#     block/elevator.c:767 forward-declares it and :774 calls it:
+	#         bool task_is_booster(struct task_struct *tsk);
+	#         ...
+	#             if (task_is_booster(current))
+	#                 return count;
+	#         ld.lld: error: undefined symbol: task_is_booster
+	#         >>> referenced by elevator.o:(elv_iosched_store) in archive block/built-in.a
+	#
+	#     The obvious suspect is the MTK scheduler, since CONFIG_MTK_SCHEDULER is
+	#     one of our =n pins. It is not. Searched, and found nothing:
+	#       - all 35 .c/.h files under kernel/sched/            no mention
+	#       - all 19 files under drivers/misc/mediatek/sched/  no mention
+	#         (common.c, fair.c, eas/{sched_main,sched_sys_common,eas_plus,
+	#          topology,static_power,core_pause,rotate}.c, sugov/*, core_ctl/*)
+	#       - include/linux/sched.h                            no mention
+	#       - the only occurrences of the string "booster" anywhere in the
+	#         repository are drivers/input/{evdev_booster.c,input_booster.c,
+	#         input_booster_mtk.c}, include/linux/input/input_booster.h,
+	#         drivers/regulator/stm32-booster.c and a stm32 devicetree binding
+	#       - the only file-scope task_* definitions in kernel/sched/ are
+	#         task_wants_autogroup, task_prio, task_can_attach, task_numa_free,
+	#         task_numa_fault and task_cputime[_adjusted]
+	#     CONFIG_MTK_TASK_TURBO is =m in the vendor defconfig but no file reads
+	#     it in a way that would provide this symbol.
+	#
+	#     So this is a forward declaration to a function that does not exist in
+	#     this kernel at all. No config value can bring it back, and leaving the
+	#     call in place means the link can never succeed. The call is dead code
+	#     here: there is no booster to consult, so removing it changes no
+	#     behaviour, it only stops the linker looking for something absent.
+	#
+	#     Both the declaration and the call are removed together, and the
+	#     verification checks that neither the declaration nor the symbol name
+	#     survives, so a tree that *does* define it would be left alone.
+	local elev_c="${KERNEL_DIR}/block/elevator.c"
+	if [ -f "$elev_c" ] && grep -q '^bool task_is_booster(struct task_struct \*tsk);$' "$elev_c"; then
+		sed -i '/^bool task_is_booster(struct task_struct \*tsk);$/d' "$elev_c"
+		sed -i '/^\tif (task_is_booster(current))$/,+1d' "$elev_c"
+		if grep -q 'task_is_booster' "$elev_c"; then
+			warn "ELEVATOR: task_is_booster still referenced after removal"
+		else
+			info "ELEVATOR: removed the call to task_is_booster (no definition exists in this tree)"
+		fi
+	elif [ -f "$elev_c" ] && grep -q 'task_is_booster' "$elev_c"; then
+		warn "ELEVATOR: task_is_booster present but the pattern did not match; leaving it alone"
+	fi
+
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
 	#     after 20 errors and says so:
 	#         ld.lld: error: too many errors emitted, stopping now
