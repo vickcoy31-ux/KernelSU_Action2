@@ -535,6 +535,30 @@ prepare_defconfig() {
 		info "AFE: built mtk-afe-external.o into vmlinux (was obj-m, dead with MODULES=n)"
 	fi
 
+	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
+	#     after 20 errors and says so:
+	#         ld.lld: error: too many errors emitted, stopping now
+	#                 (use --error-limit=0 to see all errors)
+	#     Runs #76, #77 and #78 each reported exactly 20, which read as
+	#     "20 outstanding" and was wrong each time -- #78 fixed 17 and 17
+	#     different ones appeared underneath. The real count has never been
+	#     known. This is not instrumentation that can fail: it only changes how
+	#     many errors the linker reports before stopping, and a successful link
+	#     is unaffected. Keep it permanently.
+	#
+	#     ${LD} is invoked directly here, so the flag takes no -Wl, prefix.
+	#     CONFIG_LTO_CLANG is off in this build (CONFIG_LTO_NONE=y), which is
+	#     the branch this line is in; the other branch is the ${CC} one below it.
+	local link_sh="${KERNEL_DIR}/scripts/link-vmlinux.sh"
+	if [ -f "$link_sh" ] && grep -q 'error-limit' "$link_sh"; then
+		info "LINK: --error-limit=0 already present"
+	elif [ -f "$link_sh" ] && grep -q '${LD} ${KBUILD_LDFLAGS} ${LDFLAGS_vmlinux}' "$link_sh"; then
+		sed -i 's|${LD} ${KBUILD_LDFLAGS} ${LDFLAGS_vmlinux}|& --error-limit=0|' "$link_sh"
+		info "LINK: lld will now report every undefined symbol, not just 20"
+	else
+		warn "LINK: could not find the vmlinux link line in link-vmlinux.sh; the 20-error cap will stay"
+	fi
+
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
