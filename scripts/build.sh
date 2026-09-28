@@ -315,6 +315,14 @@ prepare_defconfig() {
 			}
 			{ print }
 		' "$sec_reset_h" >"$sec_reset_h.new" && mv "$sec_reset_h.new" "$sec_reset_h"
+		# Diagnostic (run #70): this patch reported success and the file verified
+		# clean, yet the compiler later rejected the SAME file at the SAME lines
+		# with an unterminated block comment. One of those two facts has to be
+		# wrong, and nothing in the log says which. Print the region verbatim so
+		# the next run shows the bytes instead of requiring another guess.
+		group "SEC_RESET: patched region (diagnostic)"
+		sed -n '225,240p' "$sec_reset_h" | cat -A | sed 's/^/    /'
+		endgroup
 		# Verify the file still parses, not just that the marker landed. An
 		# earlier version of this patch emitted a bare "\t/*" line, which opened
 		# a block comment that was never closed; the following four lines were
@@ -435,6 +443,16 @@ build_kernel() {
 		|| die "defconfig generation failed"
 
 	info "make ${args}"
+	# Diagnostic (run #70): dump this file again, right before the compiler
+	# sees it. If it differs from the dump taken just after patching, something
+	# is rewriting it in between and that is the bug. If it matches, then the
+	# patch step itself lied and the earlier dump is the one to distrust.
+	if [ -f "${KERNEL_DIR}/drivers/samsung/sec_hard_reset_hook.c" ]; then
+		group "SEC_RESET: same region, pre-compile (diagnostic)"
+		sed -n '225,240p' "${KERNEL_DIR}/drivers/samsung/sec_hard_reset_hook.c" |
+			cat -A | sed 's/^/    /'
+		endgroup
+	fi
 	# shellcheck disable=SC2086
 	make -j"$(nproc --all)" CC="$cc" $args \
 		|| die "kernel build failed"
