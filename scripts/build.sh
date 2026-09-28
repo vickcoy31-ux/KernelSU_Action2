@@ -303,11 +303,10 @@ prepare_defconfig() {
 		grep -q "^$(printf '\t')register_mrdump_reset_delay(" "$sec_reset_h"; then
 		awk '
 			/^\tregister_mrdump_reset_delay\(hard_reset_delay\);$/ && !done {
-				print "\t/* sec-mrdump-guard: provider is CONFIG_MTK_AEE_IPANIC, unreachable"
-				print "\t/* while CONFIG_MTK_AEE_FEATURE is pinned n in EXTRA_DEFCONFIG."
-				print "\t/* This only widened the hard-reset window; the panic path is"
-				print "\t/* untouched. */"
-				print "\t/*"
+				print "\t/* sec-mrdump-guard: provider is CONFIG_MTK_AEE_IPANIC,"
+				print "\t/* unreachable while CONFIG_MTK_AEE_FEATURE is pinned n in"
+				print "\t/* EXTRA_DEFCONFIG. This only widened the hard-reset window;"
+				print "\t/* the panic path is untouched. */"
 				print "#if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)"
 				print "\tregister_mrdump_reset_delay(hard_reset_delay);"
 				print "#endif"
@@ -316,10 +315,28 @@ prepare_defconfig() {
 			}
 			{ print }
 		' "$sec_reset_h" >"$sec_reset_h.new" && mv "$sec_reset_h.new" "$sec_reset_h"
-		if [ "$(grep -c 'sec-mrdump-guard' "$sec_reset_h" || true)" -eq 1 ]; then
+		# Verify the file still parses, not just that the marker landed. An
+		# earlier version of this patch emitted a bare "\t/*" line, which opened
+		# a block comment that was never closed; the following four lines were
+		# swallowed and clang rejected the file with -Werror=comment, costing run
+		# #68. Counting the marker alone could not see that, so check the actual
+		# invariant: the file must not end inside a block comment.
+		#
+		# Note C comments do NOT nest, so "/*" seen while already inside a comment
+		# is plain text. A naive grep -c counts those as new openers and reports
+		# phantom unterminated comments.
+		if [ "$(grep -c 'sec-mrdump-guard' "$sec_reset_h" || true)" -eq 1 ] &&
+			[ "$(awk '
+				{ line = $0
+				  while (length(line) > 0) {
+					if (!incomment) { o = index(line, "/*"); if (o == 0) break
+						incomment = 1; line = substr(line, o + 2) }
+					else { c = index(line, "*/"); if (c == 0) break
+						incomment = 0; line = substr(line, c + 2) } } }
+				END { print incomment ? 1 : 0 }' "$sec_reset_h")" = "0" ]; then
 			info "SEC_RESET: guarded register_mrdump_reset_delay() call (provider pinned off)"
 		else
-			warn "SEC_RESET: expected 1 guard -- check manually"
+			warn "SEC_RESET: guard did not verify -- file may be left inside a comment"
 		fi
 	fi
 

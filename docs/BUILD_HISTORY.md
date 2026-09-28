@@ -116,7 +116,48 @@ defconfig. Do **not** disable another consumer to hide it.
 | #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **FIXED** — all 8 undefined symbols gone; run failed on a single new `duplicate symbol` instead |
 | #66 | `duplicate symbol: dmabuf_release_check` (3 sites) | build.sh patch 12 makes the header-defined helper `static inline`; plus patch 11 + SCP re-enable, and `RTC_CLASS`/`RTC_LIB`/`ODM_BOARD_ID_STATUS_SUPPORT`/`ANDROID_VENDOR_HOOKS` `=y` | **partly fixed** — `dmabuf_release_check` gone, SCP and the 4 config gates accepted; new 18-way `duplicate symbol: monitor_hang_regist_ldt` |
 | #67 | `duplicate symbol: monitor_hang_regist_ldt` (18 sites) | `CONFIG_MTK_HANG_DETECT` back to `=y`; build.sh patch 13 guards the 2 unguarded `mrdump_regist_hang_bt()` calls in `hang_detect.c` | **FIXED** — duplicate gone; exposed `TRACEPOINTS` being promptless (see §3.5) |
-| #68 | 12 undefined: 4 `mbox_*`, 8 `ccd_*`/`rpmsg_*`, 3 `tracepoint_*`, `stack_trace_save_tsk`, `register_mrdump_reset_delay` | `CONFIG_MAILBOX=y`, `CONFIG_RPMSG_MTK_CCD=y`, `CONFIG_FTRACE=y` + `CONFIG_ENABLE_DEFAULT_TRACERS=y`; build.sh patch 14 guards the mrdump call; the two no-op lines (`TRACEPOINTS`, `ANDROID_VENDOR_HOOKS`) **removed** | **in flight** |
+| #68 | 12 undefined: 4 `mbox_*`, 8 `ccd_*`/`rpmsg_*`, 3 `tracepoint_*`, `stack_trace_save_tsk`, `register_mrdump_reset_delay` | `CONFIG_MAILBOX=y`, `CONFIG_RPMSG_MTK_CCD=y`, `CONFIG_FTRACE=y` + `CONFIG_ENABLE_DEFAULT_TRACERS=y`; build.sh patch 14 guards the mrdump call; the two no-op lines (`TRACEPOINTS`, `ANDROID_VENDOR_HOOKS`) **removed** | **self-inflicted**: my own patch 14 emitted a bare `/*` line, leaving a block comment unclosed → `-Werror=comment`. Fixed in #69 |
+| #69 | patch 14 self-inflicted `-Werror=comment` + SUSFS enabled | comment-closed; self-verifying check added; `ENABLE_SUSFS=true` + `ENABLE_PATH_UMOUNT=true` | **in flight** |
+
+### 3.6 A generated block comment can void the whole file (run #68)
+
+My own patch broke the build it was meant to fix. The guard comment ended with
+a bare `/*` line:
+
+```
+	/* sec-mrdump-guard: provider is CONFIG_MTK_AEE_IPANIC, unreachable
+	/* while CONFIG_MTK_AEE_FEATURE is pinned n in EXTRA_DEFCONFIG.
+	/* This only widened the hard-reset window; the panic path is
+	/* untouched. */
+	/*                          <-- opens a comment, never closed
+#if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)
+	register_mrdump_reset_delay(hard_reset_delay);
+#endif
+```
+
+That trailing `/*` swallowed the four lines after it, and clang rejected the
+file:
+
+```
+sec_hard_reset_hook.c:232:2: error: '/*' within block comment [-Werror,-Wcomment]
+sec_hard_reset_hook.c:235:4: error: unterminated /* comment
+sec_hard_reset_hook.c:246:1: error: expected '}'
+```
+
+**Two lessons, both about verifying the right thing:**
+
+1. Counting the guard marker proved the sed/awk *ran*. It said nothing about
+   whether the file still *parsed*. Assert the post-condition, not the action.
+2. `grep -c '/\*'` vs `grep -c '\*/'` is **not** a balance check. It counts
+   lines, not occurrences; line 199 of this file has `/* 6 seconds */` on one
+   line and counts twice. And **C comments do not nest** — a `/*` inside an
+   open comment is plain text, so any checker that counts those as new openers
+   reports phantoms. Patch 14 now walks the file with an `incomment` flag and
+   fails the build if the file ends inside a comment.
+
+`DISABLE_CC_WERROR=true` does not help here: this tree sets `KCFLAGS` with
+`-Wno-error` for a specific list, and `-Wcomment` is not on it.
+
 
 ---
 
