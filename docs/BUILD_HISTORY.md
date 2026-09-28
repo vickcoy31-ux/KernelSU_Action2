@@ -696,6 +696,91 @@ were none, the `grep -c` comment-balance check, and this — all came from
 trusting output without verifying the instrument that produced it. Check that
 the instrument worked before acting on its numbers.
 
+# HANDOVER — picking this up cold
+
+Written so this can be resumed without re-deriving anything.
+
+## Current state
+
+As of run #76, the last build with a trustworthy result:
+
+```
+compile error    : 0
+duplicate symbol : 0
+undefined symbol: 0
+```
+
+The build reaches `LD vmlinux` and the link is clean. Every error chased since
+run #64 is resolved. What is **not** yet demonstrated is a successful build end
+to end — no run has ever produced a kernel image.
+
+Run #77 is in flight with `REGULATOR_TRACE_PROBE=false`, so no diagnostic
+instrumentation is active and its result can be read as-is.
+
+## If a build fails, the order that worked
+
+1. **Read the stage before reading the error.** Compile errors and link errors
+   are different problems, and lld's `--error-limit 20` applies only to the
+   link. Reading a number without knowing its stage was wrong three times.
+2. **Check the resolved `.config` artifact, not the defconfig.** The defconfig
+   is truncated; the artifact is what the build used. Every real discovery here
+   came from the artifact.
+3. **Verify the instrument before trusting it.** Three false conclusions came
+   from output being wrong, not code being wrong.
+4. One idea per run.
+
+## Traps that will bite again
+
+- **`EXTRA_DEFCONFIG` `=n` entries cut providers.** A built-in consumer cannot
+  resolve a `=n` provider in this monolithic build. All 19 `=n` entries are
+  `=m`/`=y` in the vendor defconfig; none is `n` upstream. Do not add more.
+- **Never set `CONFIG_MODULES=y`.** It inverts the `m`→`y` transpose.
+- **`ADD_KPROBES_CONFIG` must stay `false`** — it sets `CONFIG_MODULES=y`.
+- **`ENABLE_DEFAULT_TRACERS` is mutually exclusive** with `FUNCTION_TRACER`,
+  `FTRACE_SYSCALLS`, `BLK_DEV_IO_TRACE`.
+- **A `=y` absent from the resolved `.config` means promptless or
+  dependency-blocked** — adding it again cannot work (§1, §3.5).
+- **17 of the original 19 `=n` entries are untouched.** Leave them unless a log
+  says otherwise.
+
+## Fixed, do not redo
+
+| Area | Fix |
+| --- | --- |
+| 14 USB undefined symbols | `CONFIG_USB_SUPPORT/USB/USB_OTG/USB_GADGET=y` |
+| 3 swallowed directory gates | `CONFIG_DMABUF_HEAPS`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM` |
+| `-Werror` suppression dead since #43 | `KCFLAGS` is now its own config value |
+| SCP non-PIC relocation errors | build.sh patch 11 |
+| `dmabuf_release_check` 3-way duplicate | build.sh patch 12 |
+| `monitor_hang_regist_ldt` 18-way duplicate | build.sh patch 13 |
+| `register_mrdump_reset_delay` | build.sh patch 14 |
+| ged `tracing_mark_write` | build.sh patch 15 |
+| `mtk_pm_qos_update_request` | build.sh patch 16, step 1 only |
+
+## Not done, on purpose
+
+- **SUSFS.** `ENABLE_SUSFS` and `ENABLE_PATH_UMOUNT` are `false`. The
+  kernel-side patch applies but **with fuzz**; the susfs4ksu KSU-side patch does
+  not apply to ReSukiSU's current layout. ReSukiSU ships its own
+  `CONFIG_KSU_SUSFS` and `KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS` (default `y`), so
+  hiding from kallsyms already works. See §4a.
+- **`trace_mtk_pm_qos_update_request` may not actually fire.** Its prototype is
+  gone from `mtk-vmm-regulator.c` and the call compiles only because `KCFLAGS`
+  carries `-Wno-error=implicit-function-declaration`. The link is clean so the
+  duplicate is gone, but the tracepoint is probably a no-op. Verify before
+  relying on it. See §4b.
+
+## If starting completely fresh
+
+`gta9_defconfig` (7938 lines, the vendor one in the kernel repo) is
+self-consistent and is what the device ships. This whole exercise exists
+because `gta9_00_defconfig` (532 lines) is a truncated copy of it. Switching
+wholesale would very likely build in one shot, at the cost of reopening the six
+runs of multi-platform duplicate symbols (#52–#57) that `CONFIG_USB_DWC3`,
+`CONFIG_USB_MTU3_DUAL_ROLE` and `CONFIG_USB_XHCI_PLATFORM` pull in. That trade
+was considered and declined; if the incremental path is abandoned, this is the
+thing to try.
+
 ## 5. Dead / unwired files
 
 - `defconfig_fragments/gta9-disable-mtk-modules.config` — **not referenced by
