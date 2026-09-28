@@ -281,6 +281,48 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 14. register_mrdump_reset_delay (run #68). Provider is
+	#     drivers/misc/mediatek/aee/mrdump/mrdump_panic.c, gated by
+	#     CONFIG_MTK_AEE_IPANIC which 'depends on MTK_AEE_FEATURE' -- and we pin
+	#     MTK_AEE_FEATURE=n in EXTRA_DEFCONFIG because the AEE stack does not
+	#     compile on 5.10. So the pin is what makes the symbol unreachable.
+	#     Un-pinning is the wrong direction: it drags in the whole AEE stack
+	#     (MTK_AEE_AED, MTK_AEE_HANGDET) and, because MTK_AEE_FEATURE carries
+	#     'select FTRACE', it would silently turn on FTRACE as a side effect.
+	#     Only one call site exists, inside sec_reset_init(), and the symbol is
+	#     declared by a file-local 'extern' in the same file, so guarding the
+	#     call is safe: hard_reset_delay() stays defined and the panic path is
+	#     untouched. The skipped call only ever widened the hard-reset window.
+	#     Same technique already used for the iommu vendor hooks above.
+	#     Written with awk, not sed: three separate sed attempts failed on
+	#     quoting (a '|' delimiter collides with alternation, '#' collides with
+	#     the literal "#endif" in the replacement, and \1 vs $1 backreference
+	#     handling silently ate the indentation).
+	local sec_reset_h="${KERNEL_DIR}/drivers/samsung/sec_hard_reset_hook.c"
+	if [ -f "$sec_reset_h" ] && ! grep -q 'sec-mrdump-guard' "$sec_reset_h" &&
+		grep -q "^$(printf '\t')register_mrdump_reset_delay(" "$sec_reset_h"; then
+		awk '
+			/^\tregister_mrdump_reset_delay\(hard_reset_delay\);$/ && !done {
+				print "\t/* sec-mrdump-guard: provider is CONFIG_MTK_AEE_IPANIC, unreachable"
+				print "\t/* while CONFIG_MTK_AEE_FEATURE is pinned n in EXTRA_DEFCONFIG."
+				print "\t/* This only widened the hard-reset window; the panic path is"
+				print "\t/* untouched. */"
+				print "\t/*"
+				print "#if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)"
+				print "\tregister_mrdump_reset_delay(hard_reset_delay);"
+				print "#endif"
+				done = 1
+				next
+			}
+			{ print }
+		' "$sec_reset_h" >"$sec_reset_h.new" && mv "$sec_reset_h.new" "$sec_reset_h"
+		if [ "$(grep -c 'sec-mrdump-guard' "$sec_reset_h" || true)" -eq 1 ]; then
+			info "SEC_RESET: guarded register_mrdump_reset_delay() call (provider pinned off)"
+		else
+			warn "SEC_RESET: expected 1 guard -- check manually"
+		fi
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
