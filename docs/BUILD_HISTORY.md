@@ -110,7 +110,8 @@ defconfig. Do **not** disable another consumer to hide it.
 | #64 | diagnostic artifact missing | `include-hidden-files: true` on upload-artifact | good, keep |
 | #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **FIXED** — all 8 undefined symbols gone; run failed on a single new `duplicate symbol` instead |
 | #66 | `duplicate symbol: dmabuf_release_check` (3 sites) | build.sh patch 12 makes the header-defined helper `static inline`; plus patch 11 + SCP re-enable, and `RTC_CLASS`/`RTC_LIB`/`ODM_BOARD_ID_STATUS_SUPPORT`/`ANDROID_VENDOR_HOOKS` `=y` | **partly fixed** — `dmabuf_release_check` gone, SCP and the 4 config gates accepted; new 18-way `duplicate symbol: monitor_hang_regist_ldt` |
-| #67 | `duplicate symbol: monitor_hang_regist_ldt` (18 sites) | `CONFIG_MTK_HANG_DETECT` back to `=y`; build.sh patch 13 guards the 2 unguarded `mrdump_regist_hang_bt()` calls in `hang_detect.c` | **in flight** |
+| #67 | `duplicate symbol: monitor_hang_regist_ldt` (18 sites) | `CONFIG_MTK_HANG_DETECT` back to `=y`; build.sh patch 13 guards the 2 unguarded `mrdump_regist_hang_bt()` calls in `hang_detect.c` | **FIXED** — duplicate gone; exposed `TRACEPOINTS` being promptless (see §3.5) |
+| #68 | `TRACEPOINTS` cannot be set from config; `ANDROID` is `n`; providers missing for mbox/ccd/rpmsg/mrdump | open | **not started** |
 
 ---
 
@@ -207,8 +208,68 @@ a cross-module API. Fix: `static inline` in the header, so each translation
 unit gets a private copy. `inline` additionally avoids `-Wunused-function` in
 translation units that include the header but never call it.
 
-### 3.4 `MTK_HANG_DETECT` is a two-sided trap (run #66)
+### 3.5 `TRACEPOINTS` is a PROMPTLESS bool — config lines for it are silently discarded
 
+**This is the single most important finding, and it invalidates part of my own
+run #65/#66 reasoning.**
+
+`init/Kconfig:2157`:
+
+```
+config TRACEPOINTS
+	bool
+```
+
+No prompt, no `default`. So `CONFIG_TRACEPOINTS=y` written into the defconfig is
+**accepted by the file but dropped by Kconfig**. Confirmed in the resolved
+`.config` from run #67: `CONFIG_TRACEPOINTS` is **absent entirely** — not `=n`,
+not `=y`. The only way to set it is a `select` from a real symbol, e.g.
+`FTRACE`, `KPROBE_EVENTS`, `PREEMPTIRQ_TRACEPOINTS`, `HAVE_SYSCALL_TRACEPOINTS`.
+
+`kernel/Makefile` gates the provider with `obj-$(CONFIG_TRACEPOINTS) +=
+tracepoint.o`, so with the symbol unset, `for_each_kernel_tracepoint` and
+`tracepoint_probe_register` (both in `kernel/tracepoint.c`, lines 773 and 554)
+are simply never compiled — which is exactly what the linker reports.
+
+This also explains the `android_vh_logbuf` failure, which my run #66 commit
+described as only ~70% certain:
+
+```
+drivers/android/Kconfig:9      if ANDROID
+drivers/android/Kconfig:68     config ANDROID_VENDOR_HOOKS
+drivers/android/Kconfig:70     	depends on TRACEPOINTS
+drivers/android/Kconfig:123    endif # if ANDROID
+```
+
+`ANDROID_VENDOR_HOOKS` is gated behind **two** prerequisites, both currently
+false:
+
+1. `CONFIG_ANDROID` — `# CONFIG_ANDROID is not set` (absent from the truncated
+   defconfig, `bool` with no default), so the whole `drivers/android/`
+   directory is never entered.
+2. `CONFIG_TRACEPOINTS` — promptless, so it cannot be set at all from a
+   defconfig line.
+
+So `ANDROID_VENDOR_HOOKS=y` in `EXTRA_DEFCONFIG` was a **no-op**. Confirmed
+absent in the run #67 `.config` while `CONFIG_REMOTEPROC=y`,
+`CONFIG_SEC_DEBUG=y` and `CONFIG_DMABUF_HEAPS=y` from the same batch all landed
+correctly.
+
+**Rule: a `=y` line that does not appear in the resolved `.config` means the
+symbol is promptless or dependency-blocked — adding it again will never work.**
+Always check the resolved `.config` (artifact `kernel-config-<DEVICE>-<time>`),
+never infer success from the absence of an error.
+
+### Four distinct symbol classes seen so far
+
+| Class | Symptom | Example |
+| --- | --- | --- |
+| Present in vendor defconfig, missing from truncated | resolves to `n` | `CONFIG_USB` → 14 undefined symbols |
+| `bool` directory gate with no default | child tristates are `y` but the subdir is never entered | `CONFIG_DMABUF_HEAPS`, `CONFIG_REMOTEPROC` |
+| `EXTRA_DEFCONFIG` pins a shared parent to `n` | consumer elsewhere references the removed provider | `MTK_AEE_FEATURE=n` → `mrdump_regist_hang_bt` |
+| **Promptless `bool`, no `default`** | **defconfig line is silently discarded; the symbol is absent from `.config`** | **`TRACEPOINTS` → cannot be set from config at all** |
+
+### 3.4 `MTK_HANG_DETECT` is a two-sided trap (run #66)
 `drivers/misc/mediatek/include/mt-plat/aee.h` is included by ~18 objects and
 switches on one symbol:
 
