@@ -103,7 +103,7 @@ defconfig. Do **not** disable another consumer to hide it.
 | #58 | dup `tracepoint_cleanup` | make it `static` in `mtk_pbm.c` only | good, keep |
 | #58 | EXTRA_DEFCONFIG never applied | restore `EXTRA_DEFCONFIG=` prefix in `config.env` | good, keep |
 | #59 | battery-gauge dup | `CONFIG_GAUGE_MT6375=n`, `CONFIG_BATTERY_MT6359P=n` | **now causes `battery_get_profile_id`** |
-| #60 | relocation errors | `CONFIG_MTK_TINYSYS_SCP_SUPPORT=n` | **now causes 7 `scp_*` undefined symbols** |
+| #60 | `R_AARCH64_MOVW_UABS_*` relocation errors vs `scpreg`/`core_ids`/`gic_nonsecure_priorities` in `scp/rv/` | `CONFIG_MTK_TINYSYS_SCP_SUPPORT=n` | **did not work** — see §3.1; traded the relocation error for 7 undefined `scp_*` symbols |
 | #61 | vendor-hook tracepoints absent on 5.10 | bypass `android_vh_iommu_iovad_*` in `iommu_debug.c`, keep `CONFIG_MTK_IOMMU_MISC_DBG=m` | good, keep |
 | #62 | dup `dev`/`reg` globals | make `dev`/`reg` `static` in `ccu_drv.c` + `mtk-mmdvfs-debug.c` | good, keep |
 | #63 | 14 × USB undefined symbols | `CONFIG_USB_SUPPORT/USB/USB_OTG/USB_GADGET=y` from the vendor defconfig | **FIXED** — all 14 gone in run #64 |
@@ -126,11 +126,51 @@ at 20 errors (`--error-limit`), so more are hidden behind the first twenty.
 | `dmabuf_to_secure_handle` | `camera_mem.o`, `widevine_driver.o` | `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, swallowed by `CONFIG_DMABUF_HEAPS` | `CONFIG_DMABUF_HEAPS=y` (+ deferred-free, page-pool) |
 | `mtk_ccu_rproc_get_inforeg` | `misc/mediatek/vmm_dbg/mtk-vmm-dbg.o` | `CONFIG_MTK_CCU_RPROC`, swallowed by `CONFIG_REMOTEPROC` | `CONFIG_REMOTEPROC=y` |
 | `for_each_kernel_tracepoint`, `tracepoint_probe_register` | ReSukiSU tracepoint hook | `CONFIG_TRACEPOINTS` | `CONFIG_TRACEPOINTS=y` |
-| `scp_get_reserve_mem_{virt,size,phys}`, `scp_register_sensor`, `scp_deregister_sensor`, `scp_ipidev`, `scp_A_{un,}register_notify` | SCP consumers | `CONFIG_MTK_TINYSYS_SCP_SUPPORT`, pinned `n` at run #60 for "relocation errors" | **unresolved** — the original relocation error is not yet understood |
-| `mrdump_regist_hang_bt` | mrdump consumer | `CONFIG_MTK_AEE_FEATURE`, pinned `n` at run #47 | **unresolved** |
+| `scp_get_reserve_mem_{virt,size,phys}`, `scp_register_sensor`, `scp_deregister_sensor`, `scp_ipidev`, `scp_A_{un,}register_notify` | `sensorhub/ipi_comm.o` (19+ refs), `sensorhub/ready.o`, `conn_scp/conap_scp_ipi.o` | see §3.1 — neither config value works | **needs a source patch** |
+| `mrdump_regist_hang_bt` | `misc/mediatek/monitor_hang/hang_detect.o` | `CONFIG_MTK_AEE_FEATURE`, pinned `n` at run #47 | **unresolved** |
+| `for_each_kernel_tracepoint`, `tracepoint_probe_register` | `pbm/mtk_pbm.o`, `mtprof/bootprof.o`, `pidmap/pidmap.o` | `CONFIG_TRACEPOINTS` | fixed in run #65 |
 | `register_trace_android_vh_logbuf` | logbuf consumer | vendor-hook infrastructure | **unresolved** |
 | `rtc_time64_to_tm` | rtc consumer | `CONFIG_RTC_CLASS` | **unresolved** |
 | `g_board_id_status` | `misc/mediatek/usb20/musb_dr.o` | unknown | **unresolved** |
+
+### 3.1 The SCP trap — why `MTK_TINYSYS_SCP_SUPPORT` cannot be config'd either way
+
+`drivers/misc/mediatek/scp/Makefile` is, in full:
+
+```make
+obj-y += rv/
+```
+
+No config gate at all — `rv/` is *always* built in. Meanwhile
+`drivers/misc/mediatek/scp/rv/Makefile`:
+
+```make
+obj-$(CONFIG_MTK_TINYSYS_SCP_SUPPORT) += scp.o
+...
+ccflags-y += -D DEBUG_DO -fno-pic -mcmodel=large
+```
+
+So only two outcomes exist, and both fail:
+
+| Value | Outcome | Observed in |
+| --- | --- | --- |
+| `y` or `m` | the `-fno-pic -mcmodel=large` objects land in `drivers/built-in.a`; lld rejects their `R_AARCH64_MOVW_UABS_*` absolute relocations against the PIE vmlinux | run #60 |
+| `n` | no objects are built at all, so `scp_ipidev`, `scp_A_register_notify`, `scp_get_reserve_mem_*` etc. become undefined | run #64 |
+
+Disabling it did not fix run #60, it only traded the relocation error for seven
+undefined symbols, because the consumers are **not** gated on the same symbol:
+
+| Symbol | Consumers (all built-in) |
+| --- | --- |
+| `scp_ipidev` | `misc/mediatek/sensor/2.0/sensorhub/ipi_comm.o` |
+| `scp_A_register_notify` | `sensorhub/ready.o`, `conn_scp/conap_scp/conap_scp_ipi.o` |
+| `scp_get_reserve_mem_{virt,size,phys}` | sensorhub |
+
+**Fix:** source-patch `rv/Makefile` to drop `-fno-pic -mcmodel=large` so the
+objects are linkable into vmlinux, and set
+`CONFIG_MTK_TINYSYS_SCP_SUPPORT=y`. Follow the existing numbered-patch pattern
+in `scripts/build.sh` rather than trying to solve it with config.
+
 
 ### Dead symbols — do not bother setting these
 
