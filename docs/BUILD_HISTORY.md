@@ -118,6 +118,10 @@ defconfig. Do **not** disable another consumer to hide it.
 | #67 | `duplicate symbol: monitor_hang_regist_ldt` (18 sites) | `CONFIG_MTK_HANG_DETECT` back to `=y`; build.sh patch 13 guards the 2 unguarded `mrdump_regist_hang_bt()` calls in `hang_detect.c` | **FIXED** — duplicate gone; exposed `TRACEPOINTS` being promptless (see §3.5) |
 | #68 | compile failure in `sec_hard_reset_hook.c` — 5 errors, all from one unterminated block comment | fixed in #69; the 12 undefined symbols from #67 were **never retested** because the build died before reaching the link |
 | #69 | patch 14 self-inflicted `-Werror=comment` + SUSFS enabled | comment-closed; self-verifying check added; `ENABLE_SUSFS=true` + `ENABLE_PATH_UMOUNT=true` | **in flight** |
+| #72–#74 | 3 × `duplicate symbol: mtk_pm_qos_update_request` | build.sh patch 16 | duplicate cleared in #76 |
+| #75 | build died before compiling — bare `grep -c` returns 1 under `set -e` | all counts made non-fatal | good, keep |
+| #76 | duplicate **fixed**; 20 undefined reported by a probe whose `-imacros` path was wrong | probe hardened, then switched off | the 20 were **real** — see §4c |
+| #77 | probe off, still 20 undefined, 0 duplicate, 0 compile | commit `c89d25c`: media core + `CONFIG_ANDROID` restored, patch 5 revised, patch 17 added, 2 consumers dropped | **run #78** |
 
 ### 3.6 A generated block comment can void the whole file (run #68)
 
@@ -696,38 +700,186 @@ were none, the `grep -c` comment-balance check, and this — all came from
 trusting output without verifying the instrument that produced it. Check that
 the instrument worked before acting on its numbers.
 
+### Correction: the instrument was broken, but the symbols were real too
+
+The section above is right that the probe in #76 failed and that the 20 symbols
+it reported were fabricated. It is **wrong** in its reasoning for dismissing
+them — the claim that they "cannot plausibly be absent" was simply false. See
+§4c: with the probe switched off, run #77 reported the same 20.
+
+## 4c. Run #77 — lld stops at the first duplicate, so errors hide in layers
+
+Run #77, probe off, `REGULATOR_TRACE_PROBE=false`:
+
+```
+compile error (.c:N:N: error:) : 0
+duplicate symbol                : 0
+undefined symbol                : 20
+```
+
+Same 20 as #76, and the probe was not running. So they are real. The count
+also tells the story of the last three runs:
+
+| run | duplicate | undefined | reached |
+|-----|-----------|-----------|---------|
+| #72 | 6 | 0 | `LD vmlinux` |
+| #73 | 3 | 0 | `LD vmlinux` |
+| #74 | 3 | 0 | `LD vmlinux` |
+| #76 | 0 | 20 | `LD vmlinux` |
+| #77 | 0 | 20 | `LD vmlinux` |
+
+`undefined = 0` in #72–#74 did **not** mean a clean link. A `duplicate symbol`
+is fatal to lld: it stops there, so it never gets as far as reporting the
+undefined references sitting underneath. Clearing the duplicates in #76 did not
+create these 20 — it uncovered them.
+
+The proof that nothing regressed in between: the resolved `.config` artifacts
+from #74 and #77 are **identical** for every symbol involved. Both have
+
+```
+# CONFIG_MEDIA_SUPPORT is not set
+CONFIG_MEDIA_CONTROLLER=y
+```
+
+`CONFIG_MEDIA_CONTROLLER=y` with `MEDIA_SUPPORT` off is itself a symptom of the
+truncated defconfig — a value that survived its own dependency.
+
+**General rule, and the reason to read the stage before the count:** lld's
+`--error-limit 20` only applies to the link, and the link reports at most one
+class of fatal problem. `duplicate = 0` is not a clean bill of health, it is
+just proof the layer above cleared. Always ask which stage produced a number.
+
+### The 20, grouped by what was actually wrong
+
+| # | Symbols | Cause | Fix |
+|---|---------|-------|-----|
+| 11 | `video_device_alloc`, `v4l2_ctrl_*`, `v4l2_async_*`, `media_entity_pads_init`, `v4l2_fwnode_endpoint_parse` | media core absent from the truncated defconfig | `CONFIG_MEDIA_SUPPORT=y`, `CONFIG_VIDEO_DEV=y`, +8 more, all `=y` in the vendor defconfig |
+| 3 | `register_trace_android_vh_{show_mem,logbuf,meminfo_proc_show}` | `CONFIG_ANDROID` off, so `ANDROID_VENDOR_HOOKS` could never be satisfied | `CONFIG_ANDROID=y` |
+| 3 | `n3d_init`, `n3d_exit`, `set_sensor_streaming_state` | **my own regression** — patch 5, below | patch 5 revised |
+| 2 | `register_/unregister_3way_semaphore_notifier` | `obj-m` under `CONFIG_MODULES=n` | new patch 17 |
+| 1 | `exec_ccci_kern_func_by_md_id` | provider gated on `CONFIG_MTK_ECCCI_DRIVER`, our run-#48 pin | `CONFIG_MTK_PMIC_PROTECT=n` |
+| 1 | `connectivity_register_state_notifier` | provider gated on `CONFIG_MTK_COMBO`, our pin | `CONFIG_MTK_CONN_SCP=n` |
+
+### Patch 5 was a regression I introduced, and I had marked it solved
+
+Patch 5 (run #55/#56) deleted the whole line
+
+```make
+include $(IMGSENSOR_DRIVER_PATH)/common/$(COMMON_VERSION)/n3d_fsync/Makefile
+```
+
+from `src/isp6s/Makefile`. That did clear the duplicate symbols. It also removed
+`n3d.o`, `n3d_clk.o`, `n3d_hw.o` and `vsync_recorder.o` from
+`imgsensor_isp6s-objs`, and `src/common/v1_1/imgsensor.c` calls into them from
+`imgsensor_init()` and `imgsensor_ioctl()` with no `#ifdef`. Six duplicate
+symbols traded for three undefined ones, and the duplicate fix was recorded as
+done and stayed done for twenty runs.
+
+The correct cut is narrower. `n3d_fsync/Makefile` is only a wrapper; the
+duplicated objects come one level down, in
+`n3d_fsync/frame-sync/frame_sync_drv.mk`, which adds `frame_sync.o`,
+`frame_sync_algo.o` and `frame_monitor.o` — the same three `src-v4l2/frame-sync`
+builds. The include stays; those three lines go. `frame_sync_drv.mk` is a
+different file from the `src-v4l2` copy, so the edit cannot reach it, and its
+`subdir-ccflags-y` block is kept because it is unrelated to the objects and does
+set the include path `n3d.c` is compiled with.
+
+Checked before editing: `vsync_recorder` exists only under
+`common/v1_1/n3d_fsync/`, and no `n3d*` file exists anywhere under
+`src-v4l2/`, so restoring the include cannot reintroduce a duplicate.
+
+### `obj-m` is a silent dead end under `CONFIG_MODULES=n`
+
+`register_3way_semaphore_notifier()` is defined in exactly one place,
+`sound/soc/mediatek/common/mtk-afe-external.c`, and that Makefile hangs it off
+
+```make
+obj-m += mtk-afe-external.o
+```
+
+With `CONFIG_MODULES=n` that builds nothing at all. There is no second route to
+the file either: `CONFIG_SOUND` is off, so `sound/Makefile` never descends into
+`soc/`; `sound/soc/Makefile` enters `mediatek/` only under `CONFIG_SND_SOC`; and
+`sound/soc/mediatek/Makefile` enters `common/` only under
+`CONFIG_SND_SOC_MEDIATEK`. Three gates deep, all closed, none of them obvious
+from the error message.
+
+Turning on the ALSA/SOC stack to reach one 58-line file that includes nothing
+but its own header and `<linux/module.h>` is far larger a change than the
+problem, so patch 17 instead makes the three directories reachable
+(`obj-y += soc/` → `obj-y += mediatek/` → `obj-y += common/`) and flips that one
+line to `obj-y`. Every other entry in those three Makefiles stays behind its own
+`CONFIG_*`, so nothing else is pulled in. Each edit is guarded by a `grep -q`,
+so a re-run is a no-op.
+
+**Class:** any `obj-m` line in a tree without modules is a rule that has never
+been exercised. It fails as an *undefined symbol in a completely different
+driver*, with nothing in the message pointing at the Makefile at fault. Worth
+grepping the tree for when an undefined symbol has no obvious provider.
+
+### Two pins where the consumer is the right thing to drop
+
+For the last two symbols the provider is gated behind a `=n` that **we** set
+ourselves, and the consumer calls it unguarded:
+
+- `exec_ccci_kern_func_by_md_id` — declared in `include/mt-plat/mtk_ccci_common.h`,
+  defined in the `eccci` tree, gated on `CONFIG_MTK_ECCCI_DRIVER`, pinned `=n`
+  in run #48 because that tree could not find `scp_ipi.h`. Consumer is
+  `pmic_protect/mt63xx-oc-debug.c`, gated on `CONFIG_MTK_PMIC_PROTECT`, which
+  has no `#ifdef` around the call.
+- `connectivity_register_state_notifier` — defined in
+  `connectivity/common/connectivity_build_in_adapter.o`, built by
+  `obj-$(CONFIG_MTK_COMBO)`, another of our pins. Consumer is
+  `conn_scp/conap_scp/conap_scp_core.c`, gated on `CONFIG_MTK_CONN_SCP`, calling
+  it unguarded at `conap_scp_init()`.
+
+The standing rule in this repo is *fix the provider, never disable the consumer*,
+because disabling a consumer orphans whatever was consuming **it**. It does not
+apply here, for two reasons. First, the pins were not arbitrary — reopening
+`CONFIG_MTK_ECCCI_DRIVER` would undo the run-#48 work outright. Second, with
+the provider gone the consumer cannot function anyway: there is no notifier
+list for it to register on, and no modem IPC transport to call. Dropping the
+consumer loses a driver that was already non-functional, and it is small and
+self-contained, so the blast radius is one Makefile's worth of objects rather
+than an entire subsystem.
+
 # HANDOVER — picking this up cold
 
 Written so this can be resumed without re-deriving anything.
 
 ## Current state
 
-As of run #76, the last build with a trustworthy result:
+As of run #77, the last completed run with a trustworthy result:
 
 ```
-compile error    : 0
-duplicate symbol : 0
-undefined symbol: 0
+compile error (.c:N:N: error:) : 0
+duplicate symbol                : 0
+undefined symbol                : 20
 ```
 
-The build reaches `LD vmlinux` and the link is clean. Every error chased since
-run #64 is resolved. What is **not** yet demonstrated is a successful build end
-to end — no run has ever produced a kernel image.
+The build reaches `LD vmlinux` and the link is now free of duplicates. The 20
+undefined symbols are addressed in commit `c89d25c` (see §4c), and run #78 is the
+test of that. What is **not** yet demonstrated is a successful build end to
+end — no run has ever produced a kernel image.
 
-Run #77 is in flight with `REGULATOR_TRACE_PROBE=false`, so no diagnostic
-instrumentation is active and its result can be read as-is.
+Run #78 has no diagnostic instrumentation active, so its result can be read
+as-is.
 
 ## If a build fails, the order that worked
 
 1. **Read the stage before reading the error.** Compile errors and link errors
    are different problems, and lld's `--error-limit 20` applies only to the
    link. Reading a number without knowing its stage was wrong three times.
-2. **Check the resolved `.config` artifact, not the defconfig.** The defconfig
+2. **Know that `duplicate symbol: 0` does not mean the link is clean.** lld
+   stops dead on a duplicate, so an earlier run reporting `undefined = 0` may
+   simply never have got as far as checking. Every fix uncovers a layer.
+3. **Check the resolved `.config` artifact, not the defconfig.** The defconfig
    is truncated; the artifact is what the build used. Every real discovery here
-   came from the artifact.
-3. **Verify the instrument before trusting it.** Three false conclusions came
+   came from the artifact. Comparing two runs' artifacts side by side is what
+   proved the 20 symbols in #77 were not a regression.
+4. **Verify the instrument before trusting it.** Three false conclusions came
    from output being wrong, not code being wrong.
-4. One idea per run.
+5. One idea per run.
 
 ## Traps that will bite again
 
@@ -742,6 +894,13 @@ instrumentation is active and its result can be read as-is.
   dependency-blocked** — adding it again cannot work (§1, §3.5).
 - **17 of the original 19 `=n` entries are untouched.** Leave them unless a log
   says otherwise.
+- **Any `obj-m` line is dead** in this tree. It builds nothing under
+  `CONFIG_MODULES=n` and surfaces as an undefined symbol in an unrelated
+  driver, with no hint that a Makefile is at fault.
+- **A fix that trades one error class for another is not a fix.** Patch 5
+  removed six duplicate symbols and introduced three undefined ones; it was
+  filed under "fixed" and stayed there for twenty runs. When a fix removes a
+  build unit, check what else that unit provided before marking it done.
 
 ## Fixed, do not redo
 
@@ -756,6 +915,12 @@ instrumentation is active and its result can be read as-is.
 | `register_mrdump_reset_delay` | build.sh patch 14 |
 | ged `tracing_mark_write` | build.sh patch 15 |
 | `mtk_pm_qos_update_request` | build.sh patch 16, step 1 only |
+| 11 video/v4l2 undefined | `CONFIG_MEDIA_SUPPORT`, `CONFIG_VIDEO_DEV`, +8 (commit `c89d25c`) |
+| 3 `android_vh` undefined | `CONFIG_ANDROID=y` (commit `c89d25c`) |
+| 3 `n3d_*` undefined | patch 5 revised — keeps the include, drops the 3 duplicate objects |
+| 2 `*_3way_semaphore_notifier` | build.sh patch 17, new |
+| `exec_ccci_kern_func_by_md_id` | `CONFIG_MTK_PMIC_PROTECT=n` |
+| `connectivity_register_state_notifier` | `CONFIG_MTK_CONN_SCP=n` |
 
 ## Not done, on purpose
 
