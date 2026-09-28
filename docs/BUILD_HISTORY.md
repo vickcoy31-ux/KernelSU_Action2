@@ -530,6 +530,71 @@ something we have to add.
    `CONFIG_KSU_SUSFS=y` rather than re-introducing the susfs4ksu KSU-side
    patch. Leave `KSU_HOOK_MODE=tracepoint` alone.
 
+## 4b. Duplicate tracepoints: one fixed, one deliberately deferred (run #72)
+
+Run #72 was the first build to reach the `vmlinux` link with a working
+compiler, and it produced **zero undefined symbols**. Everything chased since
+#67 is resolved. What was left were six duplicate symbols forming two pairs:
+
+```
+__tracepoint_tracing_mark_write        kernel/trace/trace_tracing_mark_write.c  vs  ged_log.c
+__tracepoint_mtk_pm_qos_update_request regulator/mtk-dvfsrc-regulator.c         vs  mtk-vmm-regulator.c
+```
+(plus `__traceiter_` and `__SCK__tp_func_` variants of each)
+
+### Why these appeared only now
+
+`CONFIG_TRACEPOINTS` finally resolved to `y` in run #68, via
+`ENABLE_DEFAULT_TRACERS`. Until then `kernel/trace/` was never compiled at all,
+so the upstream `tracing_mark_write` event did not exist to collide with. This
+is a consequence of a genuine fix, not a regression — but it is the second time
+turning a ghost on has exposed more work underneath.
+
+### Key fact about how TRACE_EVENT names things
+
+`TRACE_SYSTEM` does **not** appear in the symbol a `TRACE_EVENT` generates —
+that symbol is always `__tracepoint_<event>`. `TRACE_INCLUDE_FILE` names the
+generated *file*, not the symbol. So two different `TRACE_SYSTEM`s may still
+collide if they declare the same event name.
+
+### Pair 1 — fixed in #73
+
+`drivers/gpu/mediatek/ged/include/ged_tracepoint.h` declares
+`TRACE_EVENT(tracing_mark_write, ...)`; upstream declares the same event name.
+`ged_log.c` includes the header and **never calls the tracepoint**, so the fix
+is a rename with no call-site change and no behaviour change. build.sh patch 15.
+
+### Pair 2 — traced, NOT fixed (deliberate)
+
+`drivers/regulator/mtk-vmm-trace.h` lines 15-44 are a **byte-identical
+copy-paste** of `drivers/regulator/mtk-dvfsrc-regulator-trace.h` lines 15-40:
+the same `DECLARE_EVENT_CLASS(mtk_pm_qos_request, ...)` plus the same
+`DEFINE_EVENT(mtk_pm_qos_request, mtk_pm_qos_update_request, ...)`. Its include
+guard is `_TRACE_ISPDVFS_EVENTS_H`, which is not even this file's name — more
+evidence it was pasted.
+
+Both files have a correct, distinct `TRACE_INCLUDE_FILE`, which is why the
+duplication was not caught earlier: each file legitimately generates its own
+tracepoint code, and both use the same event name.
+
+**Why it was deferred rather than fixed.** Deleting lines 15-44 from
+`mtk-vmm-trace.h` does remove the duplicate, and leaves `TRACE_INCLUDE_FILE`,
+`<trace/define_trace.h>` and `vmm__update_voltage` intact. But
+`mtk-vmm-regulator.c:248` still calls `trace_mtk_pm_qos_update_request`, and
+after the removal that file has no prototype for it — dvfsrc supplies the
+*symbol* at link time, not a *declaration* at compile time. The result would
+compile with an implicit-declaration warning which **would not fail the build**,
+because #72 turned on `-Wno-error=implicit-function-declaration`. That risks the
+VMM tracepoint silently doing nothing, which is harder to notice later than a
+build failure.
+
+The correct fix is to delete the duplicate block **and** add an explicit
+`DECLARE_TRACE`/`TRACE_EVENT` declaration for the borrowed event in
+`mtk-vmm-regulator.c`. That needs a real compile to confirm, so it is a
+deliberate next step, not a drive-by patch.
+
+**Do not treat `trace_mtk_pm_qos_update_request` as working until that is done.**
+
 ## 5. Dead / unwired files
 
 - `defconfig_fragments/gta9-disable-mtk-modules.config` — **not referenced by

@@ -353,6 +353,34 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 15. ged tracepoint collides with an upstream event (run #72).
+	#     drivers/gpu/mediatek/ged/include/ged_tracepoint.h declares
+	#         TRACE_EVENT(tracing_mark_write, ...)
+	#     but tracing_mark_write is ALSO declared upstream in
+	#     kernel/trace/trace_tracing_mark_write.c. TRACE_SYSTEM does not appear
+	#     in the symbol a TRACE_EVENT generates -- the name is always
+	#     __tracepoint_<event> -- and TRACE_INCLUDE_FILE only names the
+	#     generated *file*, not the symbol. So ged_log.o and
+	#     kernel/built-in.a both emit __tracepoint_tracing_mark_write:
+	#         ld.lld: error: duplicate symbol: __tracepoint_tracing_mark_write
+	#         >>> defined at trace_tracing_mark_write.c  kernel/built-in.a
+	#         >>> defined at ged_log.c                   drivers/built-in.a
+	#     and likewise __traceiter_ and __SCK__tp_func_ for the same event.
+	#     ged_log.c only includes the header and never calls the tracepoint, so
+	#     renaming the event needs no call-site change and no behaviour change.
+	#     This became visible in #72 only because run #68 turned on
+	#     ENABLE_DEFAULT_TRACERS, which for the first time made CONFIG_TRACEPOINTS
+	#     resolve to y and pulled kernel/trace/ into the build at all.
+	local ged_tp="${KERNEL_DIR}/drivers/gpu/mediatek/ged/include/ged_tracepoint.h"
+	if [ -f "$ged_tp" ] && grep -q '^TRACE_EVENT(tracing_mark_write,$' "$ged_tp"; then
+		sed -i 's/^TRACE_EVENT(tracing_mark_write,$/TRACE_EVENT(ged_tracing_mark_write,/' "$ged_tp"
+		if grep -q '^TRACE_EVENT(ged_tracing_mark_write,$' "$ged_tp"; then
+			info "GED_TRACEPOINT: renamed tracing_mark_write -> ged_tracing_mark_write (upstream name clash)"
+		else
+			warn "GED_TRACEPOINT: rename did not verify"
+		fi
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
