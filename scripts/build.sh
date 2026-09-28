@@ -304,9 +304,14 @@ prepare_defconfig() {
 		awk '
 			/^\tregister_mrdump_reset_delay\(hard_reset_delay\);$/ && !done {
 				print "\t/* sec-mrdump-guard: provider is CONFIG_MTK_AEE_IPANIC,"
-				print "\t/* unreachable while CONFIG_MTK_AEE_FEATURE is pinned n in"
-				print "\t/* EXTRA_DEFCONFIG. This only widened the hard-reset window;"
-				print "\t/* the panic path is untouched. */"
+				print "\t * unreachable while CONFIG_MTK_AEE_FEATURE is pinned n in"
+				print "\t * EXTRA_DEFCONFIG. This only widened the hard-reset window;"
+				print "\t * the panic path is untouched."
+				print "\t *"
+				print "\t * This is ONE block comment on purpose. A \"/*\" at the start"
+				print "\t * of a continuation line is a nested comment, and this tree"
+				print "\t * rejects those as -Werror=comment. An earlier version of"
+				print "\t * this patch did exactly that and cost runs #68 and #70. */"
 				print "#if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)"
 				print "\tregister_mrdump_reset_delay(hard_reset_delay);"
 				print "#endif"
@@ -429,6 +434,24 @@ build_kernel() {
 	fi
 
 	local cc="clang" args
+
+	# KCFLAGS is a standalone config value, exported by config.sh like every other
+	# key, and re-exported here so it survives into the kbuild sub-makes.
+	#
+	# It cannot live in EXTRA_CMDS: $args is deliberately expanded unquoted so it
+	# word-splits into separate make variables, so any KCFLAGS value containing
+	# spaces would be torn into several bogus arguments. The previous
+	# comma-joined form in EXTRA_CMDS was rejected wholesale by clang:
+	#   warning: unknown -Werror warning specifier: '-Wno-error,-Wno-error=...'
+	# which means DISABLE_CC_WERROR had never actually applied since run #43.
+	# Makefile:1090 consumes it as a single value: KBUILD_CFLAGS += $(KCFLAGS)
+	if [ -n "${KCFLAGS:-}" ]; then
+		export KCFLAGS
+		info "KCFLAGS: ${KCFLAGS}"
+	else
+		unset KCFLAGS || true
+	fi
+
 	args=$(make_args)
 	if is_true "${ENABLE_CCACHE:-true}" && command -v ccache >/dev/null; then
 		cc="ccache clang"

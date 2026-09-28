@@ -31,6 +31,7 @@ declare -A DEFAULTS=(
 	[ADD_LOCALVERSION_TO_FILENAME]="false"
 	[EXTRA_CMDS]=""
 	[CUSTOM_CMDS]=""
+	[KCFLAGS]=""
 
 	# Toolchain
 	[USE_CUSTOM_CLANG]="false"
