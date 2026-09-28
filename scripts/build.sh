@@ -147,18 +147,18 @@ prepare_defconfig() {
 		info "DW9763AF: made read_data static"
 	fi
 
-	# 8. Thermal/power (run #57): mtk_cm_mgr_common.c and mtk_pbm.c both define
-	#    a global 'void tracepoint_cleanup(void)'. Verified by git grep: the
-	#    only references are inside each own file, so make both static.
+	# 8. Thermal/power (run #57): mtk_pbm.c and mtk_cm_mgr_common.c both define
+	#    a global 'void tracepoint_cleanup(void)' -> duplicate symbol under lld.
+	#    Only the PBM copy is made static. cm_mgr is a cross-subsystem power
+	#    manager: keeping its copy static could leave an undefined reference
+	#    from callers outside drivers/misc/mediatek. Static in PBM alone removes
+	#    the collision; the definition is at line 677 of mtk_pbm.c and its only
+	#    call is in the same file (line 947), so the regex below (anchored at
+	#    line start) never touches the call.
 	local pbm_c="${KERNEL_DIR}/drivers/misc/mediatek/pbm/mtk_pbm.c"
 	if [ -f "$pbm_c" ] && grep -q "void tracepoint_cleanup(void)" "$pbm_c"; then
 		sed -i 's/^void tracepoint_cleanup(void)/static void tracepoint_cleanup(void)/' "$pbm_c"
-		info "PBM: made tracepoint_cleanup static"
-	fi
-	local cm_c="${KERNEL_DIR}/drivers/misc/mediatek/cm_mgr/mtk_cm_mgr_common.c"
-	if [ -f "$cm_c" ] && grep -q "void tracepoint_cleanup(void)" "$cm_c"; then
-		sed -i 's/^void tracepoint_cleanup(void)/static void tracepoint_cleanup(void)/' "$cm_c"
-		info "CM_MGR: made tracepoint_cleanup static"
+		info "PBM: made tracepoint_cleanup static (cm_mgr copy left untouched)"
 	fi
 
 
