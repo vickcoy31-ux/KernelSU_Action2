@@ -431,6 +431,86 @@ defconfig is the truncated one and is not what the build used.
 
 ---
 
+## 4a. ReSukiSU + SUSFS: what is actually possible (run #69)
+
+Run #69 failed in `Apply kernel patches`, not at link:
+
+```
+50_add_susfs_in_gki-android12-5.10.patch applied with fuzz; verify the result
+failed to apply 10_enable_susfs_for_ksu.patch
+susfs4ksu's ... still target the old flat KernelSU layout; modern forks have
+since moved to a modular kernel/ tree
+```
+
+### The kernel-side half works, with a caveat
+
+The kernel patch applies — but **with fuzz**, meaning some context lines did not
+match and `patch` force-fitted it. The build would continue, so this would not
+surface as a failure. `SUSFS_BRANCH` is correctly auto-resolved: kernel 5.10 →
+`gki-android12-5.10`.
+
+### ReSukiSU ships SUSFS Kconfig natively
+
+`kernel/Kconfig` in ReSukiSU @ `main` already declares:
+
+```
+config KSU_SUSFS
+	bool "SUSFS Inline Hook"
+	  SuSFS Officially support kernel 5.10+
+	  But the kernel side susfs compatibility MUST completed by yourself.
+```
+
+plus `KSU_SUSFS_SUS_PATH`, `_SUS_MOUNT`, `_SUS_KSTAT`, `_SPOOF_UNAME`,
+`_ENABLE_LOG`, `_SPOOF_CMDLINE_OR_BOOTCONFIG`, `_OPEN_REDIRECT`, `_SUS_MAP` —
+**more** than the susfs4ksu patch offers.
+
+So the failure is **not** that ReSukiSU cannot do SUSFS.
+
+### What is missing is the implementation, not the config
+
+`ReSukiSU/kernel/selinux/` contains only `rules.c`, `selinux.c`, `selinux.h`,
+`sepolicy.c`, `selinux_defs.h`. There is no `susfs_zygote_sid`, no
+`susfs_set_batch_sid()`, no `ksu_handle_sys_reboot()`. All of that lives in
+the patch that failed to apply.
+
+### Why the patch does not apply
+
+The patch edits identifiers ReSukiSU has since removed or replaced:
+
+| Patch touches | Current ReSukiSU |
+| --- | --- |
+| `hook/tp_marker.h` | **removed** → replaced by `static_key_true` |
+| `ksu_stop_input_hook_runtime()` | **renamed** → `ksu_is_input_hook_enabled` |
+| `ksu_late_loaded` | **removed** |
+| `ksu_bundled` | **removed** |
+| `input_event_kp` kprobe | **gone** → syscall-table hook instead |
+
+`patches.sh` predicted this in its own warning text.
+
+**Worse, the patch rewrites `ksu_handle_sys_reboot`, which collides with the
+tracepoint hook mode that run #61 established.** Applying it would risk
+regressing that fix.
+
+### Worth knowing regardless
+
+```
+config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+	default y
+```
+
+ReSukiSU hides `ksu`/`susfs` symbols from `/proc/kallsyms` **by default**,
+independent of the `ENABLE_SUSFS` switch. That is a stock feature, not
+something we have to add.
+
+### Plan
+
+1. Get the image booting first — the 48 remaining undefined symbols. Several of
+   them (`tracepoint_probe_register`, `register_trace_sys_enter`) are needed by
+   ReSukiSU itself, so this is not a detour.
+2. Then integrate SUSFS on top of a working tree, using ReSukiSU's own
+   `CONFIG_KSU_SUSFS=y` rather than re-introducing the susfs4ksu KSU-side
+   patch. Leave `KSU_HOOK_MODE=tracepoint` alone.
+
 ## 5. Dead / unwired files
 
 - `defconfig_fragments/gta9-disable-mtk-modules.config` — **not referenced by
