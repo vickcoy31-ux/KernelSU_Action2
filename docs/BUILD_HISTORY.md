@@ -108,7 +108,8 @@ defconfig. Do **not** disable another consumer to hide it.
 | #62 | dup `dev`/`reg` globals | make `dev`/`reg` `static` in `ccu_drv.c` + `mtk-mmdvfs-debug.c` | good, keep |
 | #63 | 14 × USB undefined symbols | `CONFIG_USB_SUPPORT/USB/USB_OTG/USB_GADGET=y` from the vendor defconfig | **FIXED** — all 14 gone in run #64 |
 | #64 | diagnostic artifact missing | `include-hidden-files: true` on upload-artifact | good, keep |
-| #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **in flight** |
+| #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **FIXED** — all 8 undefined symbols gone; run failed on a single new `duplicate symbol` instead |
+| #66 | `duplicate symbol: dmabuf_release_check` (3 sites) | build.sh patch 12 makes the header-defined helper `static inline`; plus patch 11 + SCP re-enable, and `MTK_HANG_DETECT=n`, `RTC_CLASS`/`RTC_LIB`/`ODM_BOARD_ID_STATUS_SUPPORT`/`ANDROID_VENDOR_HOOKS` `=y` | **in flight** |
 
 ---
 
@@ -170,6 +171,49 @@ undefined symbols, because the consumers are **not** gated on the same symbol:
 objects are linkable into vmlinux, and set
 `CONFIG_MTK_TINYSYS_SCP_SUPPORT=y`. Follow the existing numbered-patch pattern
 in `scripts/build.sh` rather than trying to solve it with config.
+
+
+### 3.2 Header-defined helper causing a 3-way duplicate (run #65)
+
+`drivers/dma-buf/heaps/mtk_heap_priv.h:63` **defines a function in the header
+body** with external linkage:
+
+```c
+/* common function */
+void dmabuf_release_check(const struct dma_buf *dmabuf)
+{
+	...
+	WARN(!list_empty(&dmabuf->attachments), ...);
+```
+
+Every `.c` that includes it — `mtk_sec_heap.c`, `mtk_heap_debug.c` and
+`system_heap.c` — therefore emits its own global copy, and lld reports:
+
+```
+ld.lld: error: duplicate symbol: dmabuf_release_check
+>>> defined at system_heap.c   dma-buf/heaps/system_heap.o
+>>> defined at mtk_sec_heap.c   dma-buf/heaps/mtk_sec_heap.o
+>>> defined at mtk_heap_debug.c dma-buf/heaps/mtk_heap_debug.o
+```
+
+Note the grep trap: none of the three `.c` files *mentions* the name except as a
+**call site** — the definition only exists in the header, so searching the
+sources for a definition finds nothing.
+
+`include/linux/dma-buf.h` has **no** declaration for that name, confirming it is
+purely an MTK debug helper (WARNs and dumps leftover dma-buf attachments), never
+a cross-module API. Fix: `static inline` in the header, so each translation
+unit gets a private copy. `inline` additionally avoids `-Wunused-function` in
+translation units that include the header but never call it.
+
+### 3.3 Remaining symbols, traced
+
+| Symbol | Provider | Gating | Why it was `n` |
+| --- | --- | --- | --- |
+| `mrdump_regist_hang_bt` | `aee/mrdump/mrdump_panic.c` | `CONFIG_MTK_AEE_IPANIC` ← `CONFIG_MTK_AEE_FEATURE` | our own `EXTRA_DEFCONFIG` forces `MTK_AEE_FEATURE=n`. The consumer `monitor_hang/hang_detect.c` is gated by the **independent** `CONFIG_MTK_HANG_DETECT`, and its calls at lines 1537/1550 are **unguarded** in the vendor source, so no macro can hide them. Since `MTK_AEE_FEATURE` is pinned `n` because it does not compile on 5.10, the consumer is the side that has to go: `CONFIG_MTK_HANG_DETECT=n` loses hang detection only |
+| `rtc_time64_to_tm` | `drivers/rtc/lib.c` | `CONFIG_RTC_LIB` — a **promptless `bool`** reachable only via `select` from `CONFIG_RTC_CLASS`, which is `default n` and absent from the truncated defconfig | same hidden-bool class as `DMABUF_HEAPS`/`REMOTEPROC`. Fix `CONFIG_RTC_CLASS=y` **and** `CONFIG_RTC_LIB=y` explicitly, since a later explicit `n` would silently override the `select`. The device does have an MT6397 PMIC RTC, so this is correct for the hardware |
+| `g_board_id_status` | `mediatek/board_id/board_id_status.c` | `CONFIG_ODM_BOARD_ID_STATUS_SUPPORT` — `tristate` **with a prompt but no `default`** | absent from the truncated defconfig. It is an ODM board-id var, not Samsung; the only DT node is for project `ot11`, so on gta9 the driver never probes and the variable simply stays `0` |
+| `register_trace_android_vh_logbuf` | `drivers/android/vendor_hooks.c` (`EXPORT_TRACEPOINT_SYMBOL_GPL`) | `CONFIG_ANDROID_VENDOR_HOOKS` **and** `CONFIG_TRACEPOINTS` — `DECLARE_HOOK` degrades to `DECLARE_EVENT_NOP` unless both are set | both absent from the truncated defconfig, `=y` in the vendor one. Not fully confirmed which object referenced it in run #64, but setting both makes consumer and provider self-consistent |
 
 
 ### Dead symbols — do not bother setting these

@@ -209,6 +209,44 @@ prepare_defconfig() {
 		info "MMDVFS_DEBUG: made dev and reg static (dup symbol vs ccu_drv)"
 	fi
 
+	# 11. SCP rv/ must be linkable into vmlinux (run #60 -> #64). This is a trap:
+	#     there is NO config value that works.
+	#     drivers/misc/mediatek/scp/Makefile is only 'obj-y += rv/' with no config
+	#     gate, while rv/Makefile compiles every object with '-fno-pic
+	#     -mcmodel=large' and gates them on CONFIG_MTK_TINYSYS_SCP_SUPPORT.
+	#       * =y -> the non-PIC objects land in drivers/built-in.a and lld rejects
+	#         their R_AARCH64_MOVW_UABS_* absolute relocations against the PIE
+	#         vmlinux (run #60).
+	#       * =n -> nothing is built, so scp_ipidev, scp_A_{un,}register_notify and
+	#         scp_get_reserve_mem_* become undefined, because the consumers
+	#         (sensorhub/ipi_comm.o, sensorhub/ready.o, conap_scp_ipi.o) are NOT
+	#         gated on the same symbol (run #64).
+	#     Dropping -fno-pic -mcmodel=large makes the objects position independent,
+	#     so lld can relax the relocations and they link into vmlinux normally.
+	#     arm64 is PIC by default, so this is a no-op for codegen quality.
+	local scp_rv_mk="${KERNEL_DIR}/drivers/misc/mediatek/scp/rv/Makefile"
+	if [ -f "$scp_rv_mk" ] && grep -q -- '-fno-pic -mcmodel=large' "$scp_rv_mk"; then
+		sed -i 's/ -fno-pic -mcmodel=large//' "$scp_rv_mk"
+		info "SCP_RV: dropped -fno-pic -mcmodel=large so rv/ links into vmlinux"
+	fi
+
+	# 12. dma-buf heap duplicate (run #65): drivers/dma-buf/heaps/mtk_heap_priv.h
+	#     *defines* dmabuf_release_check() in the header body with external
+	#     linkage. Every .c that includes it -- mtk_sec_heap.c,
+	#     mtk_heap_debug.c and system_heap.c -- therefore emits its own global
+	#     copy, and lld reports "duplicate symbol: dmabuf_release_check" with
+	#     three "defined at" sites. include/linux/dma-buf.h has no declaration
+	#     for that name, so it is purely an MTK debug helper (it WARNs and dumps
+	#     leftover dma-buf attachments), never a cross-module API. Giving each
+	#     includer a private inline copy is behaviour-identical and removes the
+	#     collision. 'inline' also avoids -Wunused-function in the translation
+	#     units that include the header but never call it.
+	local mtk_priv_h="${KERNEL_DIR}/drivers/dma-buf/heaps/mtk_heap_priv.h"
+	if [ -f "$mtk_priv_h" ] && grep -q '^void dmabuf_release_check(' "$mtk_priv_h"; then
+		sed -i 's/^void dmabuf_release_check(/static inline void dmabuf_release_check(/' "$mtk_priv_h"
+		info "DMABUF_HEAP: made header-defined dmabuf_release_check static inline (dup symbol)"
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
