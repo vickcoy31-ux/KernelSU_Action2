@@ -595,6 +595,64 @@ deliberate next step, not a drive-by patch.
 
 **Do not treat `trace_mtk_pm_qos_update_request` as working until that is done.**
 
+### Pair 2, attempt 1 — step 1 worked, step 2 did not (run #74)
+
+Run #74 kept all three duplicates even though both halves of build.sh patch 16
+reported success:
+
+```
+[*] REGULATOR_TRACE: removed the copied DECLARE_EVENT_CLASS/DEFINE_EVENT
+[*] REGULATOR_TRACE: mtk-vmm-regulator.c now takes the declaration from the dvfsrc header
+```
+
+Step 1 is real — the pasted block is gone. Step 2 does nothing, and the reason
+looks correct but is not:
+
+```
+include/trace/define_trace.h:93   #define TRACE_HEADER_MULTI_READ
+include/trace/define_trace.h:95   #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
+include/trace/define_trace.h:99   #define DECLARE_TRACE(name, proto, args)   <- no-op
+include/trace/define_trace.h:118  #undef TRACE_HEADER_MULTI_READ
+```
+
+`define_trace.h` defines `TRACE_HEADER_MULTI_READ` **itself**, re-reads the
+header to collect `DECLARE_TRACE` prototypes, then undefines it. The dvfsrc
+header guard is `#if !defined(_TRACE_MTK_QOS_REGULATOR_H) || defined(TRACE_HEADER_MULTI_READ)`.
+
+So the multi-read path is driven **by define_trace.h re-including the header**,
+not by the `.c` including it a second time. `TRACE_HEADER_MULTI_READ` is
+defined nowhere in the sources — it is a transient define internal to
+`define_trace.h`.
+
+A plain extra `#include` from `mtk-vmm-regulator.c` therefore does **not**
+produce a declaration: the guard sees `_TRACE_MTK_QOS_REGULATOR_H` already set
+and `TRACE_HEADER_MULTI_READ` unset, skips the body, and the trailing
+`define_trace.h` re-emits from the still-defined `CREATE_TRACE_POINTS`. The
+linker confirms it — the symbol still comes from `mtk-vmm-regulator.o` at
+`__tracepoints+0x40`.
+
+### Why step 2 was reverted rather than rewritten
+
+The natural replacement is `DECLARE_TRACE(mtk_pm_qos_update_request, ...)`,
+available from `include/linux/tracepoint.h:419`. Two things are unverified and
+either could waste a run:
+
+1. `TP_PROTO` appears in **no `.c` file anywhere** in the tree. It is meant for
+   use inside `TRACE_EVENT`; using it at file scope may not compile.
+2. `mtk-vmm-regulator.c` includes `mtk-vmm-trace.h`, which pulls in
+   `define_trace.h`, which **redefines `DECLARE_TRACE` to a no-op** at line 99.
+   If that happens first, a `DECLARE_TRACE` placed after the include is
+   silently a no-op — and we are back to an implicit declaration that will not
+   fail the build, because `KCFLAGS` now carries
+   `-Wno-error=implicit-function-declaration`.
+
+Both need a real preprocessor to settle. There is no compiler on the workstation,
+and guessing is what produced three wrong conclusions in a row earlier. So
+patch 16 keeps only the verified step 1, and step 2 is **not committed**.
+
+**Next step:** either a run that dumps the resolved preprocessor input around
+that include, or install a compiler on the runner, before any further edit.
+
 ## 5. Dead / unwired files
 
 - `defconfig_fragments/gta9-disable-mtk-modules.config` — **not referenced by

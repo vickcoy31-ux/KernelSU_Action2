@@ -398,22 +398,30 @@ prepare_defconfig() {
 	#     <trace/define_trace.h> and TRACE_EVENT(vmm__update_voltage) are
 	#     outside the removed range and stay intact.
 	#
-	#     Step 2: mtk-vmm-regulator.c still calls trace_mtk_pm_qos_update_request
-	#     at line 249, and dvfsrc supplies that symbol at LINK time, not a
-	#     prototype at COMPILE time. Left alone that is an implicit
-	#     declaration -- and KCFLAGS now carries -Wno-error=implicit-function-
-	#     declaration, so it would compile clean and the tracepoint would
-	#     silently do nothing. Instead, include the dvfsrc header from the vmm
-	#     .c. That header is written in the TRACE_HEADER_MULTI_READ style: its
-	#     body is guarded by _TRACE_MTK_QOS_REGULATOR_H while the trailing
-	#     <trace/define_trace.h> sits outside the guard. The translation unit
-	#     already pulled in define_trace.h via the vmm header, so the second
-	#     include skips the body and emits the DEFINE_EVENT as a DECLARE_TRACE
-	#     -- a declaration, no symbol. That is the vendor's own mechanism, not
-	#     a hand-written prototype.
+	#     Step 2 (attempted in #74, DID NOT WORK -- reverted): include the dvfsrc
+	#     header from the vmm .c, on the theory that its TRACE_HEADER_MULTI_READ
+	#     style would yield a DECLARE_TRACE. It does not. TRACE_HEADER_MULTI_READ
+	#     is defined nowhere in the sources; define_trace.h defines it itself at
+	#     line 93, re-reads the header at line 95 to collect prototypes, then
+	#     undefines it at line 118:
+	#         include/trace/define_trace.h:93   #define TRACE_HEADER_MULTI_READ
+	#         include/trace/define_trace.h:95   #include TRACE_INCLUDE(TRACE_INCLUDE_FILE)
+	#         include/trace/define_trace.h:99   #define DECLARE_TRACE(name, proto, args)  <- no-op
+	#         include/trace/define_trace.h:118  #undef TRACE_HEADER_MULTI_READ
+	#     So the multi-read path is driven by define_trace.h re-including the
+	#     header, not by the .c including it again. A second plain include skips
+	#     the guarded body and the trailing define_trace.h re-emits the symbol from
+	#     the still-defined CREATE_TRACE_POINTS. The linker confirmed it: the
+	#     duplicate survived, still coming from mtk-vmm-regulator.o.
 	#
-	#     Both steps are guarded and idempotent; verified by dry-running each on a
-	#     real copy of both files.
+	#     The obvious replacement is DECLARE_TRACE(...), available from
+	#     include/linux/tracepoint.h:419, but two things must be checked first and
+	#     both need a real preprocessor (there is no compiler on the workstation):
+	#       a) TP_PROTO appears in no .c file anywhere -- it may only be valid
+	#          inside TRACE_EVENT;
+	#       b) define_trace.h:99 redefines DECLARE_TRACE to a no-op, so a
+	#          DECLARE_TRACE placed after the vmm include may be silently dropped.
+	#     Both are dumped below so the next run settles it with evidence.
 	local vmm_tp="${KERNEL_DIR}/drivers/regulator/mtk-vmm-trace.h"
 	if [ -f "$vmm_tp" ] && grep -q '^DECLARE_EVENT_CLASS(mtk_pm_qos_request,$' "$vmm_tp"; then
 		# Lines 15..44 are the pasted block. Re-derive rather than hardcode: the
@@ -432,16 +440,29 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# Diagnostic (run #75): settle the two open questions with evidence instead of
+	# another guess. Preprocess the vmm regulator .c the same way the build does
+	# and report what DECLARE_TRACE and the tracepoint call actually became.
 	local vmm_c="${KERNEL_DIR}/drivers/regulator/mtk-vmm-regulator.c"
-	if [ -f "$vmm_c" ] && grep -q 'trace_mtk_pm_qos_update_request' "$vmm_c" &&
-		! grep -q 'mtk-dvfsrc-regulator-trace.h' "$vmm_c"; then
-		# The line is at column 0, not indented.
-		sed -i 's|^#include "mtk-vmm-trace.h"$|#include "mtk-vmm-trace.h"\n#include "mtk-dvfsrc-regulator-trace.h"|' "$vmm_c"
-		if grep -q 'mtk-dvfsrc-regulator-trace.h' "$vmm_c"; then
-			info "REGULATOR_TRACE: mtk-vmm-regulator.c now takes the declaration from the dvfsrc header"
+	if [ -f "$vmm_c" ] && is_true "${REGULATOR_TRACE_PROBE:-false}"; then
+		group "REGULATOR_TRACE: preprocessor probe"
+		local probe="${WORKSPACE}/vmm_probe.i"
+		if (cd "$KERNEL_DIR" && "${CLANG_PATH:-clang}/clang" -E -I. -Iinclude \
+			-D__KERNEL__ -DKBUILD_MODNAME='"probe"' -DCONFIG_TRACEPOINTS=1 \
+			-DCONFIG_TRACEPOINTS=1 "$vmm_c" >"$probe" 2>"${probe}.err"); then
+			ok "preprocessed OK -> ${probe}"
 		else
-			warn "REGULATOR_TRACE: include insertion failed"
+			warn "preprocess failed; stderr:"
+			sed 's/^/      /' "${probe}.err" | head -20
 		fi
+		echo "--- does the call site survive? ---"
+		grep -n "trace_mtk_pm_qos_update_request" "$probe" | head -5 | sed 's/^/      /' || \
+			warn "call site GONE from the preprocessed output"
+		echo "--- is DECLARE_TRACE still a macro at that point? ---"
+		grep -c "define DECLARE_TRACE" "$probe" | sed 's/^/      #define DECLARE_TRACE occurrences: /'
+		echo "--- how many __tracepoint_mtk_pm_qos_update_request definitions? ---"
+		grep -c "__tracepoint_mtk_pm_qos_update_request" "$probe" | sed 's/^/      /'
+		endgroup
 	fi
 
 
