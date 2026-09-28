@@ -381,6 +381,69 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 16. mtk_pm_qos_update_request declared in two regulator drivers (run #73).
+	#     drivers/regulator/mtk-vmm-trace.h lines 15-44 are a byte-identical
+	#     copy-paste of mtk-dvfsrc-regulator-trace.h: the same
+	#     DECLARE_EVENT_CLASS(mtk_pm_qos_request, ...) and the same
+	#     DEFINE_EVENT(mtk_pm_qos_request, mtk_pm_qos_update_request, ...).
+	#     Its include guard is _TRACE_ISPDVFS_EVENTS_H, which is not even its
+	#     own name, more evidence it was pasted. Both headers have a correct and
+	#     distinct TRACE_INCLUDE_FILE, so each legitimately generates its own
+	#     tracepoint code -- and both use the same event name, so:
+	#         ld.lld: error: duplicate symbol: __tracepoint_mtk_pm_qos_update_request
+	#         >>> defined at mtk-dvfsrc-regulator.c  regulator/built-in.a
+	#         >>> defined at mtk-vmm-regulator.c     regulator/built-in.a
+	#
+	#     Step 1: drop the copy from the vmm header. TRACE_INCLUDE_FILE,
+	#     <trace/define_trace.h> and TRACE_EVENT(vmm__update_voltage) are
+	#     outside the removed range and stay intact.
+	#
+	#     Step 2: mtk-vmm-regulator.c still calls trace_mtk_pm_qos_update_request
+	#     at line 249, and dvfsrc supplies that symbol at LINK time, not a
+	#     prototype at COMPILE time. Left alone that is an implicit
+	#     declaration -- and KCFLAGS now carries -Wno-error=implicit-function-
+	#     declaration, so it would compile clean and the tracepoint would
+	#     silently do nothing. Instead, include the dvfsrc header from the vmm
+	#     .c. That header is written in the TRACE_HEADER_MULTI_READ style: its
+	#     body is guarded by _TRACE_MTK_QOS_REGULATOR_H while the trailing
+	#     <trace/define_trace.h> sits outside the guard. The translation unit
+	#     already pulled in define_trace.h via the vmm header, so the second
+	#     include skips the body and emits the DEFINE_EVENT as a DECLARE_TRACE
+	#     -- a declaration, no symbol. That is the vendor's own mechanism, not
+	#     a hand-written prototype.
+	#
+	#     Both steps are guarded and idempotent; verified by dry-running each on a
+	#     real copy of both files.
+	local vmm_tp="${KERNEL_DIR}/drivers/regulator/mtk-vmm-trace.h"
+	if [ -f "$vmm_tp" ] && grep -q '^DECLARE_EVENT_CLASS(mtk_pm_qos_request,$' "$vmm_tp"; then
+		# Lines 15..44 are the pasted block. Re-derive rather than hardcode: the
+		# class ends where its DEFINE_EVENT closes, which is what the next
+		# TRACE_EVENT must follow.
+		local vmm_start vmm_end
+		vmm_start=$(grep -n '^DECLARE_EVENT_CLASS(mtk_pm_qos_request,$' "$vmm_tp" | head -n1 | cut -d: -f1)
+		vmm_end=$(awk -v s="$vmm_start" '
+			NR > s && /^TRACE_EVENT\(/ { print NR; exit }' "$vmm_tp")
+		[ -n "$vmm_end" ] || die "could not locate the end of the pasted block in ${vmm_tp}"
+		sed -i "${vmm_start},$((vmm_end - 1))d" "$vmm_tp"
+		if grep -q 'mtk_pm_qos_request' "$vmm_tp"; then
+			warn "REGULATOR_TRACE: mtk_pm_qos_request still present after removal"
+		else
+			info "REGULATOR_TRACE: removed the copied DECLARE_EVENT_CLASS/DEFINE_EVENT from mtk-vmm-trace.h"
+		fi
+	fi
+
+	local vmm_c="${KERNEL_DIR}/drivers/regulator/mtk-vmm-regulator.c"
+	if [ -f "$vmm_c" ] && grep -q 'trace_mtk_pm_qos_update_request' "$vmm_c" &&
+		! grep -q 'mtk-dvfsrc-regulator-trace.h' "$vmm_c"; then
+		# The line is at column 0, not indented.
+		sed -i 's|^#include "mtk-vmm-trace.h"$|#include "mtk-vmm-trace.h"\n#include "mtk-dvfsrc-regulator-trace.h"|' "$vmm_c"
+		if grep -q 'mtk-dvfsrc-regulator-trace.h' "$vmm_c"; then
+			info "REGULATOR_TRACE: mtk-vmm-regulator.c now takes the declaration from the dvfsrc header"
+		else
+			warn "REGULATOR_TRACE: include insertion failed"
+		fi
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
