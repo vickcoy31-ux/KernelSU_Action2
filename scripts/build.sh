@@ -57,6 +57,12 @@ prepare_defconfig() {
 			sed -i 's/static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' "$selinuxfs"
 			info "unstatic'd sel_handle_status_ops for ReSukiSU static-export check"
 		fi
+		# selinux_hide.c (ReSukiSU) also references selinuxfs's write_op
+		# symbol directly. Same static-export problem -> drop 'static'.
+		if [ -f "$selinuxfs" ] && grep -q "static ssize_t (\*const write_op\[\])" "$selinuxfs"; then
+			sed -i 's/static ssize_t (\*const write_op\[\])/ssize_t (*const write_op[])/' "$selinuxfs"
+			info "unstatic'd write_op for ReSukiSU"
+		fi
 
 		if is_true "${ENABLE_SUSFS:-false}"; then
 			susfs_defconfig "$DEFCONFIG_PATH"
