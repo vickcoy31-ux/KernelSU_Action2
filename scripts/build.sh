@@ -123,16 +123,30 @@ prepare_defconfig() {
 		info "MDP: kept only mdp_drv_mt6789.o (GTA9=MT6789)"
 	fi
 
-	# 5. IMGSENSOR frame-sync (run #55/#56): the legacy src/ tree builds its
-	#    own frame_monitor.o + frame_sync_algo.o via
-	#    src/common/v1_1/n3d_fsync/Makefile, and src-v4l2/frame-sync builds the
-	#    same-named objects again -> every frm_*/fs_*/FrameSync* symbol collides
-	#    under lld. GTA9 uses the v4l2 path, so drop the n3d_fsync include from
-	#    src/isp6s/Makefile; the rest of the legacy imgsensor tree stays intact.
-	local n3d_mk="${KERNEL_DIR}/drivers/misc/mediatek/imgsensor/src/isp6s/Makefile"
-	if [ -f "$n3d_mk" ] && grep -q "n3d_fsync/Makefile" "$n3d_mk"; then
-		sed -i -E '\#include .*n3d_fsync/Makefile#d' "$n3d_mk"
-		info "IMGSENSOR: dropped n3d_fsync frame-sync include (GTA9 uses src-v4l2)"
+	# 5. IMGSENSOR frame-sync (run #55/#56; REVISED in #77). The legacy src/ tree
+	#    builds its own frame_monitor.o + frame_sync_algo.o via
+	#    src/common/v1_1/n3d_fsync/frame-sync/frame_sync_drv.mk, and
+	#    src-v4l2/frame-sync/frame_sync_drv.mk builds the same-named objects
+	#    again -> every frm_*/fs_*/FrameSync* symbol collides under lld.
+	#
+	#    The first attempt deleted the whole `include .../n3d_fsync/Makefile`
+	#    line from src/isp6s/Makefile. That cleared the duplicate but it was too
+	#    blunt: n3d_fsync/Makefile is what puts n3d.o, n3d_clk.o, n3d_hw.o and
+	#    vsync_recorder.o into imgsensor_isp6s-objs, and
+	#    src/common/v1_1/imgsensor.c calls into them from imgsensor_init() and
+	#    imgsensor_ioctl(). Dropping the include therefore traded six duplicate
+	#    symbols for three undefined ones, which is what run #77 reported:
+	#        n3d_init, n3d_exit, set_sensor_streaming_state
+	#
+	#    The include stays; only the duplicated *objects* go. frame_sync_drv.mk
+	#    is a separate file from the one src-v4l2 uses, so editing it here cannot
+	#    affect the v4l2 copy. Its subdir-ccflags-y block is deliberately kept --
+	#    it is unrelated to the objects and dropping it would change the include
+	#    path n3d.c is compiled with.
+	local n3d_fsync_mk="${KERNEL_DIR}/drivers/misc/mediatek/imgsensor/src/common/v1_1/n3d_fsync/frame-sync/frame_sync_drv.mk"
+	if [ -f "$n3d_fsync_mk" ] && grep -q 'LOCAL_FSYNC_PATH)/frame_' "$n3d_fsync_mk"; then
+		sed -i -E '/^imgsensor_isp6s-objs \+=/d; /\$\(LOCAL_FSYNC_PATH\)\/frame_/d' "$n3d_fsync_mk"
+		info "IMGSENSOR: dropped the duplicated frame-sync objects, kept n3d.o"
 	fi
 
 	# 6. MDP MT6789: its file-global 'struct device *larb2' collides with the
@@ -489,6 +503,37 @@ prepare_defconfig() {
 		endgroup
 	fi
 
+
+	# 17. SCP 3-way semaphore notifier (run #77). scp_helper.c calls
+	#     register_3way_semaphore_notifier() / unregister_3way_semaphore_notifier()
+	#     from mtk-afe-external.h, but the only definition sits in
+	#     sound/soc/mediatek/common/mtk-afe-external.c, which this Makefile
+	#     hangs off obj-m:
+	#         sound/soc/mediatek/common/Makefile:20   obj-m += mtk-afe-external.o
+	#     CONFIG_MODULES is n in this tree, so obj-m builds nothing and the two
+	#     symbols are undefined at link time. There is no second route to the
+	#     file either: CONFIG_SOUND is off, so sound/Makefile never descends
+	#     into soc/, soc/Makefile only enters mediatek/ under CONFIG_SND_SOC,
+	#     and mediatek/Makefile only enters common/ under
+	#     CONFIG_SND_SOC_MEDIATEK. Enabling the ALSA/SOC stack just for this
+	#     58-line file is a far bigger change than the problem, so instead make
+	#     the three directories reachable and build the object unconditionally.
+	#     The file includes only its own header and <linux/module.h>, so it
+	#     stands alone.
+	local snd_mk="${KERNEL_DIR}/sound/Makefile"
+	local soc_mk="${KERNEL_DIR}/sound/soc/Makefile"
+	local mtk_soc_mk="${KERNEL_DIR}/sound/soc/mediatek/Makefile"
+	local afe_mk="${KERNEL_DIR}/sound/soc/mediatek/common/Makefile"
+	if [ -f "$snd_mk" ] && [ -f "$soc_mk" ] && [ -f "$mtk_soc_mk" ] && [ -f "$afe_mk" ]; then
+		# Each of these is idempotent, and only ever adds the one directory
+		# that Kbuild would otherwise skip. Every other entry in those three
+		# Makefiles stays gated on its own CONFIG_*, so nothing else is built.
+		grep -q '^obj-y += soc/$' "$snd_mk" || printf '\nobj-y += soc/\n' >>"$snd_mk"
+		grep -q '^obj-y += mediatek/$' "$soc_mk" || printf '\nobj-y += mediatek/\n' >>"$soc_mk"
+		grep -q '^obj-y += common/$' "$mtk_soc_mk" || printf '\nobj-y += common/\n' >>"$mtk_soc_mk"
+		sed -i -E 's#^obj-m \+= mtk-afe-external\.o$#obj-y += mtk-afe-external.o#' "$afe_mk"
+		info "AFE: built mtk-afe-external.o into vmlinux (was obj-m, dead with MODULES=n)"
+	fi
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
