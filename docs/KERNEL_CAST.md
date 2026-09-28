@@ -182,6 +182,59 @@ the resolved `.config`, it is shape 4. Adding it again cannot work. Check
 
 ---
 
+## 3a. The fifth shape — enemies of the same key
+
+Discovered in run #68's research. A symbol that works perfectly on its own, and
+is silently destroyed by a *different* line in the *same* run.
+
+```kconfig
+kernel/trace/Kconfig:378
+config ENABLE_DEFAULT_TRACERS
+	bool "Trace process context switches and events"
+	depends on !GENERIC_TRACER      # <-- the trap
+	select TRACING
+```
+
+`GENERIC_TRACER` is raised by `FUNCTION_TRACER`, `FTRACE_SYSCALLS` and
+`BLK_DEV_IO_TRACE`. So the moment any of those three is also set,
+`ENABLE_DEFAULT_TRACERS` becomes invisible and its line is discarded — with no
+warning, and while `FTRACE=y` still looks like it worked.
+
+Two of the three are also *worse* than they look:
+
+| Symbol | Why it is expensive |
+| --- | --- |
+| `FUNCTION_TRACER` | injects `-mfentry`/`-pg` into every object in the kernel. The vendor explicitly ships it `n`. |
+| `BLK_DEV_IO_TRACE` | the only symbol that `select TRACEPOINTS` **directly**, but it drags in `RELAY` + `DEBUG_FS` as well |
+| `FTRACE_SYSCALLS` | middle ground; needs `FTRACE=y` anyway |
+
+**Rule:** in this build, `ENABLE_DEFAULT_TRACERS` and those three are mutually
+exclusive. Pick one. This is the one failure mode that a build log cannot
+explain on its own — it looks exactly like "the config was ignored".
+
+### 3a.1 And the switch that must never be used
+
+`ci_build.sh` exposes `ADD_KPROBES_CONFIG`. It is a trap:
+
+```kconfig
+arch/Kconfig:68
+config KPROBES
+	bool "Kprobes"
+	depends on MODULES          # MODULES=n  ->  KPROBES invisible
+	depends on HAVE_KPROBES
+	select KALLSYMS
+```
+
+Setting it makes the script write `CONFIG_MODULES=y`. Since the world physics
+is the `m`→`y` transpose, turning modules on inverts the transpose: **193
+symbols in the defconfig become real modules**, and a monolithic build loses the
+providers its built-in consumers depend on. It does not fail gracefully.
+
+`ADD_KPROBES_CONFIG` must stay `false`. So must `KPROBES`, and so must anything
+that would make `KPROBES` reachable.
+
+---
+
 ## 4. How to actually move
 
 The world has no compass inside it. There is no "up" in this system. What there

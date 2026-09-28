@@ -116,7 +116,7 @@ defconfig. Do **not** disable another consumer to hide it.
 | #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **FIXED** — all 8 undefined symbols gone; run failed on a single new `duplicate symbol` instead |
 | #66 | `duplicate symbol: dmabuf_release_check` (3 sites) | build.sh patch 12 makes the header-defined helper `static inline`; plus patch 11 + SCP re-enable, and `RTC_CLASS`/`RTC_LIB`/`ODM_BOARD_ID_STATUS_SUPPORT`/`ANDROID_VENDOR_HOOKS` `=y` | **partly fixed** — `dmabuf_release_check` gone, SCP and the 4 config gates accepted; new 18-way `duplicate symbol: monitor_hang_regist_ldt` |
 | #67 | `duplicate symbol: monitor_hang_regist_ldt` (18 sites) | `CONFIG_MTK_HANG_DETECT` back to `=y`; build.sh patch 13 guards the 2 unguarded `mrdump_regist_hang_bt()` calls in `hang_detect.c` | **FIXED** — duplicate gone; exposed `TRACEPOINTS` being promptless (see §3.5) |
-| #68 | `TRACEPOINTS` cannot be set from config; `ANDROID` is `n`; providers missing for mbox/ccd/rpmsg/mrdump | open | **not started** |
+| #68 | 12 undefined: 4 `mbox_*`, 8 `ccd_*`/`rpmsg_*`, 3 `tracepoint_*`, `stack_trace_save_tsk`, `register_mrdump_reset_delay` | `CONFIG_MAILBOX=y`, `CONFIG_RPMSG_MTK_CCD=y`, `CONFIG_FTRACE=y` + `CONFIG_ENABLE_DEFAULT_TRACERS=y`; build.sh patch 14 guards the mrdump call; the two no-op lines (`TRACEPOINTS`, `ANDROID_VENDOR_HOOKS`) **removed** | **in flight** |
 
 ---
 
@@ -264,6 +264,35 @@ correctly.
 symbol is promptless or dependency-blocked — adding it again will never work.**
 Always check the resolved `.config` (artifact `kernel-config-<DEVICE>-<time>`),
 never infer success from the absence of an error.
+
+### 3.5a A fifth class: mutually exclusive selectors (run #68)
+
+The fix for the tracepoint symbols is `ENABLE_DEFAULT_TRACERS`, which `select
+TRACING`, and `TRACING` is what `select TRACEPOINTS`. But:
+
+```kconfig
+kernel/trace/Kconfig:378
+config ENABLE_DEFAULT_TRACERS
+	bool "Trace process context switches and events"
+	depends on !GENERIC_TRACER
+	select TRACING
+```
+
+`GENERIC_TRACER` is raised by `FUNCTION_TRACER`, `FTRACE_SYSCALLS` and
+`BLK_DEV_IO_TRACE`. Set any of those in the same run and
+`ENABLE_DEFAULT_TRACERS` goes invisible — **with no warning, while `FTRACE=y`
+still appears to have worked.** Never set these together with it.
+
+`ENABLE_DEFAULT_TRACERS` is the cheapest route in: no `-mfentry`
+instrumentation (that is `FUNCTION_TRACER`, which the vendor ships `n`), no
+`RELAY` or `DEBUG_FS` (that is `BLK_DEV_IO_TRACE`). It also drags in
+`STACKTRACE`, which is what supplies `stack_trace_save_tsk`.
+
+**Do not use `ADD_KPROBES_CONFIG`.** It writes `CONFIG_MODULES=y`, and since
+`KPROBES` `depends on MODULES` it is otherwise unreachable. Enabling modules
+inverts the `m`→`y` transpose, so 193 defconfig symbols become real modules and
+the monolithic build loses the providers its built-in consumers depend on. It
+does not degrade gracefully.
 
 ### Four distinct symbol classes seen so far
 
