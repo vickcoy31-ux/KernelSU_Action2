@@ -639,6 +639,52 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 21. Three file-global collisions, both sides newly built (run #80).
+	#     With the 19 run-#80 symbols gone the link was clean of undefined
+	#     references for the first time, and this is what was underneath:
+	#         duplicate symbol: helper_fp
+	#         >>> defined at cmdq-sec-mailbox.c  (patch 20 made this build)
+	#         >>> defined at cmdq-util.c
+	#         duplicate symbol: r_pos_debug
+	#         duplicate symbol: log_ctl_debug
+	#         >>> defined at gpueb_logger.c       (patch 19 made this build)
+	#         >>> defined at scp_logger.c
+	#     Same class as g_core_mask_table_dcs, larb2 and DW9763AF read_data:
+	#     file-scope names with no prefix, in a tree that is linked
+	#     monolithically so there is no module boundary to hide them. scp_logger.c
+	#     and gpueb_logger.c are near-copies of each other, which is why they
+	#     picked the same three names.
+	#
+	#     Renamed in the newly-built file only, so the older object keeps its
+	#     symbol and nothing that already resolved changes. Verified before
+	#     editing: no header in drivers/gpu/mediatek/gpueb/ or gpufreq/ declares
+	#     either name extern, and no other gpueb source file mentions them, so
+	#     both are genuinely local to gpueb_logger.c. Same check for helper_fp
+	#     across cmdq-sec-helper.c, cmdq-sec-mtee.c and mtk-cmdq-ext.h.
+	#
+	#     The \b anchors are load-bearing in the cmdq case: the file also has a
+	#     *type* called cmdq_sec_helper_fp, and '_' is a word character, so
+	#     \bhelper_fp\b cannot match inside it. A plain s/helper_fp/.../ would
+	#     have renamed the struct as well and broken the file.
+	local gl_c="${KERNEL_DIR}/drivers/gpu/mediatek/gpueb/gpueb_logger.c"
+	if [ -f "$gl_c" ] && grep -q '\br_pos_debug\b' "$gl_c"; then
+		sed -i 's/\br_pos_debug\b/gpueb_r_pos_debug/g; s/\blog_ctl_debug\b/gpueb_log_ctl_debug/g' "$gl_c"
+		if grep -q '\br_pos_debug\b\|\blog_ctl_debug\b' "$gl_c"; then
+			warn "GPUEB_LOGGER: rename left the old name behind"
+		else
+			info "GPUEB_LOGGER: r_pos_debug/log_ctl_debug renamed to file-unique names (clash with scp_logger.c)"
+		fi
+	fi
+	local cs_c="${KERNEL_DIR}/drivers/misc/mediatek/cmdq/mailbox/cmdq-sec-mailbox.c"
+	if [ -f "$cs_c" ] && grep -q '\bhelper_fp\b' "$cs_c"; then
+		sed -i 's/\bhelper_fp\b/cmdq_sec_helper_fp_inst/g' "$cs_c"
+		if grep -q 'struct cmdq_sec_helper_fp cmdq_sec_helper_fp_inst' "$cs_c"; then
+			info "CMDQ_SEC: helper_fp renamed to cmdq_sec_helper_fp_inst (clash with cmdq-util.c); the struct cmdq_sec_helper_fp type is untouched"
+		else
+			warn "CMDQ_SEC: rename did not verify"
+		fi
+	fi
+
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
 	#     after 20 errors and says so:
 	#         ld.lld: error: too many errors emitted, stopping now
