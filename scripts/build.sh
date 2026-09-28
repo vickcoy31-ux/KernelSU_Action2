@@ -447,21 +447,28 @@ prepare_defconfig() {
 	if [ -f "$vmm_c" ] && is_true "${REGULATOR_TRACE_PROBE:-false}"; then
 		group "REGULATOR_TRACE: preprocessor probe"
 		local probe="${WORKSPACE}/vmm_probe.i"
-		if (cd "$KERNEL_DIR" && "${CLANG_PATH:-clang}/clang" -E -I. -Iinclude \
-			-D__KERNEL__ -DKBUILD_MODNAME='"probe"' -DCONFIG_TRACEPOINTS=1 \
-			-DCONFIG_TRACEPOINTS=1 "$vmm_c" >"$probe" 2>"${probe}.err"); then
+		# Reuse the real build's include flags, otherwise asm/rwonce.h and the
+		# rest of the arch headers are missing and the run aborts. -imacros pulls
+		# in every symbol the build already resolved.
+		if (cd "$KERNEL_DIR" && "${CLANG_PATH:-clang}/clang" -E -imacros out/.config \
+			-I. -Iinclude -Iarch/arm64/include -Iarch/arm64/include/generated \
+			-D__KERNEL__ -DKBUILD_MODNAME='"probe"' \
+			"$vmm_c" >"$probe" 2>"${probe}.err"); then
 			ok "preprocessed OK -> ${probe}"
 		else
-			warn "preprocess failed; stderr:"
-			sed 's/^/      /' "${probe}.err" | head -20
+			warn "preprocess failed; first errors:"
+			head -8 "${probe}.err" | sed 's/^/      /' || true
 		fi
+		# Every count below must tolerate grep's exit 1 on no match: this script
+		# runs under `set -Eeuo pipefail` with an ERR trap, so a bare
+		# `grep -c` that finds nothing kills the build. That is what #75 did.
 		echo "--- does the call site survive? ---"
-		grep -n "trace_mtk_pm_qos_update_request" "$probe" | head -5 | sed 's/^/      /' || \
-			warn "call site GONE from the preprocessed output"
-		echo "--- is DECLARE_TRACE still a macro at that point? ---"
-		grep -c "define DECLARE_TRACE" "$probe" | sed 's/^/      #define DECLARE_TRACE occurrences: /'
-		echo "--- how many __tracepoint_mtk_pm_qos_update_request definitions? ---"
-		grep -c "__tracepoint_mtk_pm_qos_update_request" "$probe" | sed 's/^/      /'
+		( grep -n "trace_mtk_pm_qos_update_request" "$probe" | head -5 || true ) | sed 's/^/      /'
+		echo "--- DECLARE_TRACE directives still present? (0 = already a no-op) ---"
+		echo "      count = $(grep -c 'define DECLARE_TRACE' "$probe" || true)"
+		echo "--- TRACEPOINT hooks that create the symbol ---"
+		( grep -o '__tracepoint_mtk_pm_qos_update_request' "$probe" | wc -l || true ) |
+			sed 's/^/      occurrences: /'
 		endgroup
 	fi
 
