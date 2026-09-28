@@ -188,6 +188,27 @@ prepare_defconfig() {
 		info "IOMMU_DBG: bypassed android_vh_iommu_iovad_* vendor-hook registration"
 	fi
 
+	# 10. Duplicate 'dev' (run #63): ccu_drv.c (ccu/isp6s) and
+	#     mtk-mmdvfs-debug.c (mmdvfs) both declare a file-global
+	#     'struct device *dev;' (mmdvfs-debug also 'struct regulator *reg;')
+	#     -> duplicate symbol under lld at LD vmlinux. Both are internal to
+	#     their file: no other CCU/mmdvfs object references them via extern
+	#     (verified in ccu_hw/reg/kd_mailbox/imgsensor/qos/ipc/mva and the
+	#     mmdvfs-debug.h header, which only declares the exported function).
+	#     Make each global 'static' so the collision disappears (same pattern
+	#     as tracepoint_cleanup in run #57). Idempotent.
+	local ccu_drv="${KERNEL_DIR}/drivers/misc/mediatek/ccu/src/isp6s/ccu_drv.c"
+	if [ -f "$ccu_drv" ] && grep -q "^struct device \*dev;$" "$ccu_drv"; then
+		sed -i 's/^struct device \*dev;/static struct device *dev;/' "$ccu_drv"
+		info "CCU_DRV: made global dev static (dup symbol vs mmdvfs-debug)"
+	fi
+	local mmdvfs_dbg="${KERNEL_DIR}/drivers/misc/mediatek/mmdvfs/mtk-mmdvfs-debug.c"
+	if [ -f "$mmdvfs_dbg" ] && grep -q "^struct device \*dev;$" "$mmdvfs_dbg"; then
+		sed -i -e 's/^struct device \*dev;/static struct device *dev;/' \
+		       -e 's/^struct regulator \*reg;/static struct regulator *reg;/' "$mmdvfs_dbg"
+		info "MMDVFS_DEBUG: made dev and reg static (dup symbol vs ccu_drv)"
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
