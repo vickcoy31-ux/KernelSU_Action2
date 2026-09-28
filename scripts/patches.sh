@@ -361,6 +361,26 @@ kpm_patch_image() {
 	endgroup
 }
 
+# ReSukiSU compat (run #62): ReSukiSU's tracepoint syscall hook registers
+# 'prio_sys_enter' -- a MediaTek-only tracepoint that does not exist in this
+# 5.10 tree (GTA9). The handler signature matches the mainline 'sys_enter'
+# tracepoint (TRACE_EVENT_FN, always available with HAVE_SYSCALL_TRACEPOINTS),
+# and the unregister path already uses sys_enter. Swap the registration call
+# so the build links against the standard symbol instead of the missing one.
+# Only for the ReSukiSU variant in tracepoint hook mode; idempotent.
+resukisu_sys_enter_patch() {
+	local mode=${KSU_HOOK_MODE_RESOLVED:-${KSU_HOOK_MODE:-auto}}
+	[ "$mode" = "tracepoint" ] || return 0
+	local f="${KERNEL_DIR}/KernelSU/kernel/hook/syscall_hook_manager.c"
+	if [ "${KSU_VARIANT:-none}" != "resukisu" ] || [ ! -f "$f" ]; then
+		return 0
+	fi
+	if grep -q "register_trace_prio_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN)" "$f"; then
+		sed -i 's/register_trace_prio_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN)/register_trace_sys_enter(ksu_sys_enter_handler, NULL)/' "$f"
+		info "ReSukiSU: prio_sys_enter -> sys_enter (5.10 compat)"
+	fi
+}
+
 # --------------------------------------------------------------------- main ---
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -384,6 +404,9 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 			   [ "${KSU_HOOK_MODE_RESOLVED:-}" = "manual" ]; then
 				hooks_patch_apply
 			fi
+
+			# ReSukiSU tracepoint compat (always safe in tracepoint mode).
+			resukisu_sys_enter_patch
 
 			if is_true "${ENABLE_SUSFS:-false}";      then susfs_apply;      fi
 			if is_true "${ENABLE_HIDE_STUFF:-false}"; then hide_stuff_apply; fi
