@@ -140,11 +140,15 @@ prepare_defconfig() {
 	fi
 	# 7. Lens VCM driver (run #57): DW9763AF.c defines 'u8 read_data(u8 addr)'
 	#    which collides with cam_cal's read_data(). DW9763AF.h does NOT declare
-	#    it and no other file calls it -> make the lens VCM copy static.
+	#    it and no other file calls it. 'static' alone did NOT clear the
+	#    duplicate (still global in LD even after the sed ran, seen in run
+	#    #57/#59), so rename it to a file-unique symbol instead (same pattern
+	#    as g_core_mask_table_dcs / larb2_mdp).
 	local dw9763af="${KERNEL_DIR}/drivers/misc/mediatek/lens/vcm/proprietary/main/common/dw9763af/DW9763AF.c"
 	if [ -f "$dw9763af" ] && grep -q "u8 read_data(u8 addr)" "$dw9763af"; then
-		sed -i 's/u8 read_data(u8 addr)/static u8 read_data(u8 addr)/' "$dw9763af"
-		info "DW9763AF: made read_data static"
+		sed -i 's/u8 read_data(u8 addr)/static u8 dw9763af_read_data(u8 addr)/' "$dw9763af"
+		sed -i 's/read_data(0x00)/dw9763af_read_data(0x00)/' "$dw9763af"
+		info "DW9763AF: renamed read_data -> dw9763af_read_data (static)"
 	fi
 
 	# 8. Thermal/power (run #57): mtk_pbm.c and mtk_cm_mgr_common.c both define
