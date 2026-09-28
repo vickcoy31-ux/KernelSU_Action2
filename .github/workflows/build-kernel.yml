@@ -222,6 +222,9 @@ jobs:
         with:
           name: kernel-config-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
           path: kernel_workspace/android-kernel/out/.config
+          # .config is a dotfile, and upload-artifact v4 skips hidden files by
+          # default -- without this the artifact is silently never created.
+          include-hidden-files: true
           if-no-files-found: warn
 
       - name: Package artifacts
