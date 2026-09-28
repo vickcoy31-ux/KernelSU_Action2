@@ -448,27 +448,44 @@ prepare_defconfig() {
 		group "REGULATOR_TRACE: preprocessor probe"
 		local probe="${WORKSPACE}/vmm_probe.i"
 		# Reuse the real build's include flags, otherwise asm/rwonce.h and the
-		# rest of the arch headers are missing and the run aborts. -imacros pulls
-		# in every symbol the build already resolved.
-		if (cd "$KERNEL_DIR" && "${CLANG_PATH:-clang}/clang" -E -imacros out/.config \
+		# rest of the arch headers are missing and the run aborts.
+		# -imacros must be an ABSOLUTE path: run #75 and #76 passed "out/.config"
+		# and got "fatal error: 'out/.config' file not found", because -imacros
+		# is resolved against the include path rather than the working
+		# directory. That silently dropped every CONFIG_* define, and the build
+		# then reported 20 undefined symbols -- all of them guard-only core
+		# kernel API such as video_device_alloc and v4l2_ctrl_handler_init_class.
+		# Those 20 were an artefact of the broken probe, not a real regression.
+		# Make the probe fail loudly instead of producing misleading output: if
+		# .config is missing, say so and skip.
+		if [ ! -f "${KERNEL_DIR}/out/.config" ]; then
+			warn "REGULATOR_TRACE: ${KERNEL_DIR}/out/.config not found, skipping probe"
+		elif (cd "$KERNEL_DIR" && "${CLANG_PATH:-clang}/clang" -E \
+			-imacros "${KERNEL_DIR}/out/.config" \
 			-I. -Iinclude -Iarch/arm64/include -Iarch/arm64/include/generated \
 			-D__KERNEL__ -DKBUILD_MODNAME='"probe"' \
 			"$vmm_c" >"$probe" 2>"${probe}.err"); then
 			ok "preprocessed OK -> ${probe}"
+			# Only ever read a complete file. Every count tolerates grep's exit 1
+			# on no match: this script runs under `set -Eeuo pipefail` with an
+			# ERR trap, so a bare `grep -c` that finds nothing kills the build.
+			# That is what #75 did.
+			echo "--- does the call site survive? ---"
+			( grep -n "trace_mtk_pm_qos_update_request" "$probe" | head -5 || true ) | sed 's/^/      /'
+			echo "--- DECLARE_TRACE directives still present? (0 = already a no-op) ---"
+			echo "      count = $(grep -c 'define DECLARE_TRACE' "$probe" || true)"
+			echo "--- __tracepoint_mtk_pm_qos_update_request occurrences ---"
+			echo "      count = $(grep -o '__tracepoint_mtk_pm_qos_update_request' "$probe" | wc -l || true)"
 		else
 			warn "preprocess failed; first errors:"
 			head -8 "${probe}.err" | sed 's/^/      /' || true
+			# A failed -E still writes a partial .i. Reading it afterwards is what
+			# produced the phantom 20 undefined symbols in #76 -- the file exists,
+			# it is just missing every CONFIG_* define, so core kernel API guarded
+			# by #ifdef looked "undefined". Never analyse a partial file.
+			rm -f "$probe"
+			info "REGULATOR_TRACE: discarded the partial preprocessor output"
 		fi
-		# Every count below must tolerate grep's exit 1 on no match: this script
-		# runs under `set -Eeuo pipefail` with an ERR trap, so a bare
-		# `grep -c` that finds nothing kills the build. That is what #75 did.
-		echo "--- does the call site survive? ---"
-		( grep -n "trace_mtk_pm_qos_update_request" "$probe" | head -5 || true ) | sed 's/^/      /'
-		echo "--- DECLARE_TRACE directives still present? (0 = already a no-op) ---"
-		echo "      count = $(grep -c 'define DECLARE_TRACE' "$probe" || true)"
-		echo "--- TRACEPOINT hooks that create the symbol ---"
-		( grep -o '__tracepoint_mtk_pm_qos_update_request' "$probe" | wc -l || true ) |
-			sed 's/^/      occurrences: /'
 		endgroup
 	fi
 

@@ -653,6 +653,49 @@ patch 16 keeps only the verified step 1, and step 2 is **not committed**.
 **Next step:** either a run that dumps the resolved preprocessor input around
 that include, or install a compiler on the runner, before any further edit.
 
+### Pair 2, result of run #76 — the duplicate is FIXED
+
+Run #76 reported:
+
+```
+duplicate symbol : 0
+compile error    : 0
+```
+
+Patch 16 step 1 — deleting the pasted `DECLARE_EVENT_CLASS`/`DEFINE_EVENT`
+from `mtk-vmm-trace.h` — was sufficient on its own. The three
+`mtk_pm_qos_update_request` duplicates that survived every run since #72 are
+gone, and the build again reaches the `vmlinux` link with nothing standing in
+the way. Step 2 is therefore unnecessary and stays reverted.
+
+### The 20 undefined symbols in #76 were an artefact of the probe
+
+The same run also reported 20 undefined symbols, which looked alarming. They
+were not real:
+
+```
+<built-in>:1:19: fatal error: 'out/.config' file not found
+```
+
+The probe passed `-imacros out/.config`, and `-imacros` resolves against the
+include path rather than the working directory, so every `CONFIG_*` define was
+silently dropped. A failed `-E` still writes a partial `.i`, and the probe went
+on to read that partial file. Core kernel API guarded by `#ifdef` then looked
+missing — which is why the list was full of things that cannot plausibly be
+absent: `video_device_alloc`, `v4l2_ctrl_handler_init_class`,
+`media_entity_pads_init`, `exec_ccci_kern_func_by_md_id`.
+
+The probe now uses an absolute `-imacros` path, skips outright when `.config`
+is missing, and deletes a partial `.i` instead of reading it. It also no longer
+uses a bare `grep -c` anywhere — under `set -Eeuo pipefail` with an ERR trap a
+zero-match `grep -c` returns 1 and kills the build, which is how #75 died.
+
+**Lesson:** a diagnostic that cannot fail cleanly will invent problems. Three
+separate false conclusions today — #68 read as 48 undefined symbols when there
+were none, the `grep -c` comment-balance check, and this — all came from
+trusting output without verifying the instrument that produced it. Check that
+the instrument worked before acting on its numbers.
+
 ## 5. Dead / unwired files
 
 - `defconfig_fragments/gta9-disable-mtk-modules.config` — **not referenced by
