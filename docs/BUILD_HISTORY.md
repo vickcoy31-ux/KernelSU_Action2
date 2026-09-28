@@ -15,28 +15,62 @@ As of 2026-09-28 the build has **never succeeded**: 61 `Build Kernel` runs,
 
 ## 1. Confirmed root cause (established from build run 36435843022)
 
-Three facts, all verified against the build's own resolved `.config`:
+Four facts, all verified against the kernel tree and the build's own resolved
+`.config`:
 
 1. **`gta9_00_defconfig` is a truncated copy.** It is 532 lines. The vendor's
    real `arch/arm64/configs/gta9_defconfig` in the same tree is 7938 lines and
    is self-consistent. The trimmed copy is missing whole subsystems — the entire
    USB block, for example.
 
-2. **The build is monolithic.** Symbols that the defconfig marks `=m` come out
-   of `make defconfig` as `=y` (`CONFIG_SEC_EXT`, `CONFIG_SEC_CHIPID`,
+2. **`init/Kconfig` in this tree has no `default y` for `CONFIG_MODULES`:**
+   ```
+   menuconfig MODULES
+   	bool "Enable loadable module support"
+   	option modules
+   	help
+   ```
+   Upstream Linux 5.10 has `default y` here; this tree dropped it. So
+   `CONFIG_MODULES` resolves to `n`, and `scripts/kconfig/symbol.c` then runs
+   `/* transpose mod to yes if modules are not enabled */` — every tristate `m`
+   in the defconfig becomes `y`. Verified: `CONFIG_SEC_EXT`,
    `CONFIG_MEDIATEK_MT6577_AUXADC`, `CONFIG_MTK_CCU`, `CONFIG_MTK_VMM_DBG`,
-   `CONFIG_MTK_CAMERA_MEM_SUPPORT`, `CONFIG_MTK_WIDEVINE_DRM` all resolved `y`).
-   `CONFIG_MODULES` is not set at all.
+   `CONFIG_MTK_CAMERA_MEM_SUPPORT`, `CONFIG_MTK_WIDEVINE_DRM` are all `=m` in
+   the defconfig and all resolved `y`.
 
-3. **Consequence.** In a monolithic link, a built-in consumer can never resolve
-   a reference to a provider that is `=n` or absent. Therefore **every `=n` in
-   `EXTRA_DEFCONFIG` creates undefined symbols at the `vmlinux` link** rather
-   than fixing anything at the link stage.
+3. **The build is therefore monolithic.** "Build this as a module" is not
+   available. A built-in consumer can never resolve a reference to a provider
+   that is `=n` or absent.
 
-All 19 symbols currently pinned to `=n` in `EXTRA_DEFCONFIG` are `=m` (or `=y`)
-in the vendor's `gta9_defconfig`. **Not one of them is `n` upstream.** They were
-all switched off to work around *compile* errors (missing headers on 5.10), and
-that workaround is what now breaks the *link*.
+4. **Consequence.** Every `=n` in `EXTRA_DEFCONFIG` creates undefined symbols at
+   the `vmlinux` link rather than fixing anything at the link stage. All 19
+   symbols pinned to `=n` are `=m` (or `=y`) in the vendor's `gta9_defconfig`.
+   **Not one of them is `n` upstream.** They were switched off to work around
+   *compile* errors (missing headers on 5.10), and that workaround is what now
+   breaks the *link*.
+
+### Do NOT "fix" this with `CONFIG_MODULES=y`
+
+It would resolve the link, but it converts hundreds of currently built-in
+drivers into `.ko` files. This kernel only replaces `boot.img`; the device loads
+modules from the stock `/vendor/lib/modules`, which were not built against this
+config and would not load. Features would disappear on the device silently. A
+monolithic build is the correct shape here — fill the gaps instead.
+
+### The real gap: three swallowed directory gates
+
+These are `bool` with no `default` and absent from the defconfig, so they
+resolve to `n` and their whole subdirectory is never entered by the Makefile,
+even though Kconfig happily sets the child tristates to `y`:
+
+| Gate | Swallows | Consequence |
+| --- | --- | --- |
+| `CONFIG_DMABUF_HEAPS` | all of `drivers/dma-buf/heaps/` | `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM=m` in the defconfig is silently a no-op → `dmabuf_to_secure_handle` undefined |
+| `CONFIG_REMOTEPROC` | all of `drivers/remoteproc/` | `CONFIG_MTK_CCU_RPROC=m` in the defconfig is silently a no-op → `mtk_ccu_rproc_get_inforeg` undefined |
+| `CONFIG_NVMEM` | all of `drivers/nvmem/` | not yet reached; preemptively enabled |
+
+`CONFIG_BATTERY_ID_ADC` is a `tristate` with no `default` and is absent from the
+defconfig, so it likewise resolves to `n` on its own.
 
 **Rule:** to clear a link error, enable the provider to match the vendor
 defconfig. Do **not** disable another consumer to hide it.
@@ -46,6 +80,7 @@ defconfig. Do **not** disable another consumer to hide it.
 ## 2. Symptom → attempted → verdict
 
 `n` = do not retry.
+
 
 | Run | Symptom | What was tried | Verdict |
 | --- | --- | --- | --- |
@@ -73,29 +108,40 @@ defconfig. Do **not** disable another consumer to hide it.
 | #62 | dup `dev`/`reg` globals | make `dev`/`reg` `static` in `ccu_drv.c` + `mtk-mmdvfs-debug.c` | good, keep |
 | #63 | 14 × USB undefined symbols | `CONFIG_USB_SUPPORT/USB/USB_OTG/USB_GADGET=y` from the vendor defconfig | **FIXED** — all 14 gone in run #64 |
 | #64 | diagnostic artifact missing | `include-hidden-files: true` on upload-artifact | good, keep |
+| #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **in flight** |
 
 ---
 
-## 3. Still outstanding after run #64
+## 3. Outstanding after run #64, and what each was traced to
 
-`ld.lld: error: undefined symbol:` at `Makefile:1335: vmlinux`. Note the
-linker stops at 20 errors (`--error-limit`), so more are hidden behind the first
-twenty.
+`ld.lld: error: undefined symbol:` at `Makefile:1335: vmlinux`. The linker stops
+at 20 errors (`--error-limit`), so more are hidden behind the first twenty.
 
-| Symbol | Referenced by | Suspected provider | Status |
+| Symbol | Referenced by | Real provider (traced) | Fix |
 | --- | --- | --- | --- |
-| `secdbg_pdev` | `samsung/sec_chipid.o` | `CONFIG_SEC_DEBUG` — **confirmed absent** from `.config` | open |
-| `register_hook_bootstat` | `samsung/sec_bootstat.o` | same `CONFIG_SEC_DEBUG` group | open |
-| `get_devinfo_with_index` | `iio/adc/mt6577_auxadc.o` | `CONFIG_SEC_DEVICE_INFO` — confirmed absent | open |
-| `battery_get_profile_id` | `power/supply/mtk_battery.o` | `CONFIG_GAUGE_MT6375` — confirmed absent (pinned `n` at run #59) | open |
-| `dmabuf_to_secure_handle` | `camera_mem.o`, `widevine_driver.o` | MTK secure/TEE helper | open |
-| `mtk_ccu_rproc_get_inforeg` | `misc/mediatek/vmm_dbg/mtk-vmm-dbg.o` | `CONFIG_MTK_CCU_RPROC` — confirmed absent, its `depends on` chain failed | open |
-| `scp_get_reserve_mem_{virt,size,phys}`, `scp_register_sensor`, `scp_deregister_sensor`, `scp_ipidev`, `scp_A_{un,}register_notify` | SCP consumers | `CONFIG_MTK_TINYSYS_SCP_SUPPORT` (pinned `n` at run #60) | open |
-| `mrdump_regist_hang_bt` | mrdump consumer | `CONFIG_MTK_AEE_FEATURE` (pinned `n` at run #47) | open |
-| `for_each_kernel_tracepoint`, `tracepoint_probe_register` | ReSukiSU tracepoint hook | `CONFIG_TRACEPOINTS` | open |
-| `register_trace_android_vh_logbuf` | logbuf consumer | vendor hooks for logbuf | open |
-| `rtc_time64_to_tm` | rtc consumer | `CONFIG_RTC_CLASS` | open |
-| `g_board_id_status` | `misc/mediatek/usb20/musb_dr.o` | Samsung board-id | open |
+| `secdbg_pdev` | `samsung/sec_chipid.o` | `CONFIG_SEC_DEBUG` (`drivers/samsung/debug/sec_debug_base.c`) — forced `n` | `CONFIG_SEC_DEBUG=y` |
+| `register_hook_bootstat` | `samsung/sec_bootstat.o` | `CONFIG_SEC_DEBUG` **and** `CONFIG_SEC_BOOTSTAT` (wrapped in `#if IS_ENABLED`) | both `y` |
+| `get_devinfo_with_index` | `iio/adc/mt6577_auxadc.o` | **no provider exists in the tree.** Call site is inside the `#else` of `#if IS_ENABLED(CONFIG_MTK_DEVINFO)` | `CONFIG_MTK_DEVINFO=y` compiles the call out |
+| `battery_get_profile_id` | `power/supply/mtk_battery.o` | `CONFIG_BATTERY_ID_ADC` (`drivers/power/supply/battery_id_adc.c`). **Not** `CONFIG_GAUGE_MT6375` — that guess was wrong | `CONFIG_BATTERY_ID_ADC=y` |
+| `dmabuf_to_secure_handle` | `camera_mem.o`, `widevine_driver.o` | `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, swallowed by `CONFIG_DMABUF_HEAPS` | `CONFIG_DMABUF_HEAPS=y` (+ deferred-free, page-pool) |
+| `mtk_ccu_rproc_get_inforeg` | `misc/mediatek/vmm_dbg/mtk-vmm-dbg.o` | `CONFIG_MTK_CCU_RPROC`, swallowed by `CONFIG_REMOTEPROC` | `CONFIG_REMOTEPROC=y` |
+| `for_each_kernel_tracepoint`, `tracepoint_probe_register` | ReSukiSU tracepoint hook | `CONFIG_TRACEPOINTS` | `CONFIG_TRACEPOINTS=y` |
+| `scp_get_reserve_mem_{virt,size,phys}`, `scp_register_sensor`, `scp_deregister_sensor`, `scp_ipidev`, `scp_A_{un,}register_notify` | SCP consumers | `CONFIG_MTK_TINYSYS_SCP_SUPPORT`, pinned `n` at run #60 for "relocation errors" | **unresolved** — the original relocation error is not yet understood |
+| `mrdump_regist_hang_bt` | mrdump consumer | `CONFIG_MTK_AEE_FEATURE`, pinned `n` at run #47 | **unresolved** |
+| `register_trace_android_vh_logbuf` | logbuf consumer | vendor-hook infrastructure | **unresolved** |
+| `rtc_time64_to_tm` | rtc consumer | `CONFIG_RTC_CLASS` | **unresolved** |
+| `g_board_id_status` | `misc/mediatek/usb20/musb_dr.o` | unknown | **unresolved** |
+
+### Dead symbols — do not bother setting these
+
+`CONFIG_SEC_CHIPID` and `CONFIG_SEC_BOOTSTAT` appear in **no** `obj-` line
+anywhere. `sec_chipid.o` and `sec_bootstat.o` are members of the composite
+object `sec_ext.o`, gated solely by `CONFIG_SEC_EXT`, which is forced `y` by
+`CONFIG_SEC_MISC=y` (`SEC_MISC` is a `bool` that `depends on SEC_EXT`). Setting
+them changes nothing about the build. `CONFIG_SEC_BOOTSTAT` matters for exactly
+one thing: the `#if IS_ENABLED(CONFIG_SEC_BOOTSTAT)` around
+`register_hook_bootstat` in `sec_debug_pmsg.c`.
+
 
 ---
 
