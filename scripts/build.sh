@@ -171,6 +171,23 @@ prepare_defconfig() {
 		info "PBM: made tracepoint_cleanup static (cm_mgr copy left untouched)"
 	fi
 
+	# 9. IOMMU debug (run #61/#62): iommu_debug.c (CONFIG_MTK_IOMMU_MISC_DBG)
+	#    registers android vendor-hook tracepoints
+	#    (register_trace_android_vh_iommu_iovad_alloc/free_iova) that are NOT
+	#    generated on this 5.10 tree (CONFIG_ANDROID_VENDOR_HOOKS off) ->
+	#    undefined symbols at LD. But mtk_iommu.c NEEDS MISC_DBG=y to compile
+	#    (peri_* decls live in iommu_debug.h, included only when DBG is on).
+	#    The hooks are pure debug tracing (alloc/free_iova_hook ->
+	#    mtk_iova_dbg_*), so bypassing registration is safe and keeps the
+	#    IOMMU subsystem intact. Idempotent: replaces the two-line call with
+	#    a plain `ret = 0;` so the symbol reference disappears entirely.
+	local iommu_dbg="${KERNEL_DIR}/drivers/misc/mediatek/iommu/iommu_debug.c"
+	if [ -f "$iommu_dbg" ] && grep -q "register_trace_android_vh_iommu_iovad_alloc_iova" "$iommu_dbg"; then
+		sed -i '/ret = register_trace_android_vh_iommu_iovad_alloc_iova(alloc_iova_hook,/,/"mtk_m4u_dbg_probe");/c	ret = 0; /* vendor-hook bypass (not generated on 5.10 GTA9) */' "$iommu_dbg"
+		sed -i '/ret = register_trace_android_vh_iommu_iovad_free_iova(free_iova_hook,/,/"mtk_m4u_dbg_probe");/c	ret = 0; /* vendor-hook bypass (not generated on 5.10 GTA9) */' "$iommu_dbg"
+		info "IOMMU_DBG: bypassed android_vh_iommu_iovad_* vendor-hook registration"
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
