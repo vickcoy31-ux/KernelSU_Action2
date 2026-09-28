@@ -11,6 +11,11 @@ workflows.
 As of 2026-09-28 the build has **never succeeded**: 61 `Build Kernel` runs,
 57 failures, 0 successes.
 
+For a narrative companion — the cast, the physics, and the four symbol shapes
+that classify every failure in this file — see
+[`KERNEL_CAST.md`](KERNEL_CAST.md). This file remains the source of truth;
+the cast is only a map for reading it faster.
+
 ---
 
 ## 1. Confirmed root cause (established from build run 36435843022)
