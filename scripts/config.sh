@@ -71,6 +71,7 @@ declare -A DEFAULTS=(
 	[ADD_OVERLAYFS_CONFIG]="false"
 	[DISABLE_LTO]="false"
 	[DISABLE_CC_WERROR]="false"
+	[REGULATOR_TRACE_PROBE]="false"
 	[EXTRA_DEFCONFIG]=""
 
 	# Packaging
