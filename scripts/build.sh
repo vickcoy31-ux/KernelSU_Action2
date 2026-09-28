@@ -247,6 +247,40 @@ prepare_defconfig() {
 		info "DMABUF_HEAP: made header-defined dmabuf_release_check static inline (dup symbol)"
 	fi
 
+	# 13. monitor_hang_regist_ldt (run #66). mt-plat/aee.h is included by ~18
+	#     objects and switches on this symbol:
+	#         #if IS_ENABLED(CONFIG_MTK_HANG_DETECT)
+	#         void monitor_hang_regist_ldt(void (*fn)(void));   <- declaration
+	#         #else
+	#         void monitor_hang_regist_ldt(void (*fn)(void)) { } <- DEFINITION
+	#         #endif
+	#     So MTK_HANG_DETECT=n does not merely drop a driver: it turns the
+	#     header into a definition site and every includer emits a global copy,
+	#     giving a 18-way duplicate symbol. That is the *other* half of a
+	#     two-sided trap -- MTK_HANG_DETECT=y leaves mrdump_regist_hang_bt
+	#     undefined (its provider is under CONFIG_MTK_AEE_IPANIC, pinned n in
+	#     EXTRA_DEFCONFIG because AEE does not compile on 5.10), and =n causes
+	#     this duplicate. Keep the driver ON and fix the real problem:
+	#     hang_detect.c guards its other mrdump calls with
+	#     '#if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)' (line 561, with a panic()
+	#     fallback) but the two calls in monitor_hang_init/exit were missed by
+	#     the vendor. Apply the same guard so the build matches the vendor's own
+	#     intent.
+	#     Anchored on a single leading tab: the already-guarded call at line 562
+	#     is indented with two tabs and must not be matched.
+	local hang_c="${KERNEL_DIR}/drivers/misc/mediatek/monitor_hang/hang_detect.c"
+	if [ -f "$hang_c" ] && ! grep -q 'mrdump-regist-guard' "$hang_c" &&
+		grep -q "^$(printf '\t')mrdump_regist_hang_bt(" "$hang_c"; then
+		sed -i -E "s%^$(printf '\t')(mrdump_regist_hang_bt\((show_task_info|NULL)\);)\$%/* mrdump-regist-guard: provider is CONFIG_MTK_AEE_IPANIC, pinned n in EXTRA_DEFCONFIG */\n#if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)\n$(printf '\t')\1\n#endif%" "$hang_c"
+		local guards
+		guards=$(grep -c 'mrdump-regist-guard' "$hang_c" || true)
+		if [ "$guards" -eq 2 ]; then
+			info "HANG_DETECT: guarded 2 unguarded mrdump_regist_hang_bt() calls"
+		else
+			warn "HANG_DETECT: expected 2 guards, found ${guards} -- check manually"
+		fi
+	fi
+
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS

@@ -109,7 +109,8 @@ defconfig. Do **not** disable another consumer to hide it.
 | #63 | 14 × USB undefined symbols | `CONFIG_USB_SUPPORT/USB/USB_OTG/USB_GADGET=y` from the vendor defconfig | **FIXED** — all 14 gone in run #64 |
 | #64 | diagnostic artifact missing | `include-hidden-files: true` on upload-artifact | good, keep |
 | #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **FIXED** — all 8 undefined symbols gone; run failed on a single new `duplicate symbol` instead |
-| #66 | `duplicate symbol: dmabuf_release_check` (3 sites) | build.sh patch 12 makes the header-defined helper `static inline`; plus patch 11 + SCP re-enable, and `MTK_HANG_DETECT=n`, `RTC_CLASS`/`RTC_LIB`/`ODM_BOARD_ID_STATUS_SUPPORT`/`ANDROID_VENDOR_HOOKS` `=y` | **in flight** |
+| #66 | `duplicate symbol: dmabuf_release_check` (3 sites) | build.sh patch 12 makes the header-defined helper `static inline`; plus patch 11 + SCP re-enable, and `RTC_CLASS`/`RTC_LIB`/`ODM_BOARD_ID_STATUS_SUPPORT`/`ANDROID_VENDOR_HOOKS` `=y` | **partly fixed** — `dmabuf_release_check` gone, SCP and the 4 config gates accepted; new 18-way `duplicate symbol: monitor_hang_regist_ldt` |
+| #67 | `duplicate symbol: monitor_hang_regist_ldt` (18 sites) | `CONFIG_MTK_HANG_DETECT` back to `=y`; build.sh patch 13 guards the 2 unguarded `mrdump_regist_hang_bt()` calls in `hang_detect.c` | **in flight** |
 
 ---
 
@@ -205,6 +206,54 @@ purely an MTK debug helper (WARNs and dumps leftover dma-buf attachments), never
 a cross-module API. Fix: `static inline` in the header, so each translation
 unit gets a private copy. `inline` additionally avoids `-Wunused-function` in
 translation units that include the header but never call it.
+
+### 3.4 `MTK_HANG_DETECT` is a two-sided trap (run #66)
+
+`drivers/misc/mediatek/include/mt-plat/aee.h` is included by ~18 objects and
+switches on one symbol:
+
+```c
+#if IS_ENABLED(CONFIG_MTK_HANG_DETECT)
+void monitor_hang_regist_ldt(void (*fn)(void));      /* declaration only */
+#else
+void monitor_hang_regist_ldt(void (*fn)(void)) { }   /* DEFINITION, in a header */
+#endif
+```
+
+| Value | Result |
+| --- | --- |
+| `=y` | `hang_detect.c` is built and calls `mrdump_regist_hang_bt()` **unguarded**; its provider is `mrdump_panic.c` under `CONFIG_MTK_AEE_IPANIC` ← `CONFIG_MTK_AEE_FEATURE`, which our `EXTRA_DEFCONFIG` pins to `n` because AEE does not compile on 5.10 → undefined symbol (run #65) |
+| `=n` | the `#else` branch turns the header into a definition site, and every includer emits a global copy → **18-way duplicate symbol** (run #66) |
+
+The fix is the driver side, not the config: `hang_detect.c` already guards its
+other mrdump calls correctly —
+
+```c
+#if IS_ENABLED(CONFIG_MTK_AEE_IPANIC)
+		mrdump_regist_hang_bt(NULL);
+		mrdump_common_die(AEE_REBOOT_MODE_HANG_DETECT, "	Hang Detect", NULL);
+#else
+		panic("hang_detect: system blocked");
+#endif
+```
+
+— but the vendor missed the two calls in `monitor_hang_init` (line 1537) and
+`monitor_hang_exit` (line 1550). build.sh patch 13 applies the same guard, so
+the build matches the vendor's own intent: hang detection stays on, and the
+mrdump hook is simply skipped when AEE ipanic is unavailable.
+
+**Two sed traps hit while writing that patch, both caught by dry-running it on a
+real copy of the file first:**
+
+1. `s|...|...|` — using `|` as the `s` delimiter breaks as soon as the pattern
+   contains alternation `(show_task_info|NULL)`. Use `%`.
+2. `grep -q '^\t...'` — GNU `grep` BRE does **not** interpret `\t` as a tab. The
+   one-tab anchor silently matched nothing. Use `$(printf '\t')`.
+
+The anchor on a single leading tab is what protects the already-guarded call at
+line 562, which is indented with **two** tabs. Verified with `cat -A`:
+line 562 = `^I^I`, lines 1537/1550 = `^I`. Patch 13 is idempotent via its
+`mrdump-regist-guard` marker and asserts exactly 2 guards were added.
 
 ### 3.3 Remaining symbols, traced
 
