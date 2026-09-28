@@ -116,10 +116,29 @@ defconfig. Do **not** disable another consumer to hide it.
 | #65 | 3 swallowed directory gates + 2 no-default tristates | `CONFIG_DMABUF_HEAPS`(+deferred-free,page-pool), `CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM`, `CONFIG_REMOTEPROC`, `CONFIG_NVMEM`, `CONFIG_BATTERY_ID_ADC`, `CONFIG_MTK_DEVINFO`, `CONFIG_TRACEPOINTS` all `=y`; `CONFIG_SEC_DEBUG` `n`→`y` | **FIXED** — all 8 undefined symbols gone; run failed on a single new `duplicate symbol` instead |
 | #66 | `duplicate symbol: dmabuf_release_check` (3 sites) | build.sh patch 12 makes the header-defined helper `static inline`; plus patch 11 + SCP re-enable, and `RTC_CLASS`/`RTC_LIB`/`ODM_BOARD_ID_STATUS_SUPPORT`/`ANDROID_VENDOR_HOOKS` `=y` | **partly fixed** — `dmabuf_release_check` gone, SCP and the 4 config gates accepted; new 18-way `duplicate symbol: monitor_hang_regist_ldt` |
 | #67 | `duplicate symbol: monitor_hang_regist_ldt` (18 sites) | `CONFIG_MTK_HANG_DETECT` back to `=y`; build.sh patch 13 guards the 2 unguarded `mrdump_regist_hang_bt()` calls in `hang_detect.c` | **FIXED** — duplicate gone; exposed `TRACEPOINTS` being promptless (see §3.5) |
-| #68 | 12 undefined: 4 `mbox_*`, 8 `ccd_*`/`rpmsg_*`, 3 `tracepoint_*`, `stack_trace_save_tsk`, `register_mrdump_reset_delay` | `CONFIG_MAILBOX=y`, `CONFIG_RPMSG_MTK_CCD=y`, `CONFIG_FTRACE=y` + `CONFIG_ENABLE_DEFAULT_TRACERS=y`; build.sh patch 14 guards the mrdump call; the two no-op lines (`TRACEPOINTS`, `ANDROID_VENDOR_HOOKS`) **removed** | **self-inflicted**: my own patch 14 emitted a bare `/*` line, leaving a block comment unclosed → `-Werror=comment`. Fixed in #69 |
+| #68 | compile failure in `sec_hard_reset_hook.c` — 5 errors, all from one unterminated block comment | fixed in #69; the 12 undefined symbols from #67 were **never retested** because the build died before reaching the link |
 | #69 | patch 14 self-inflicted `-Werror=comment` + SUSFS enabled | comment-closed; self-verifying check added; `ENABLE_SUSFS=true` + `ENABLE_PATH_UMOUNT=true` | **in flight** |
 
 ### 3.6 A generated block comment can void the whole file (run #68)
+
+**Correction, recorded because the wrong version is easy to re-learn:** run #68
+did **not** fail with undefined symbols. It produced **zero** `undefined symbol`
+errors. It died in compilation, on 5 errors in one file, all caused by my own
+patch 14. I initially reported it as "48 remaining undefined symbols" by
+filtering the log loosely and reading only the first 20 matching lines.
+
+Two things made that mistake easy:
+
+- the linker's `--error-limit 20` does **not** apply to compile errors, so
+  "20 errors shown" is a number that means different things at different stages;
+- the run log is ~4.5 MB, and a loose pattern plus a head-limited read silently
+  truncates it.
+
+Consequence worth remembering: the 12 symbols fixed for run #68
+(`MAILBOX`, `RPMSG_MTK_CCD`, `FTRACE`, `ENABLE_DEFAULT_TRACERS`, and the
+`register_mrdump_reset_delay` guard) were **never actually verified**. Run #70 is
+the first build that reaches the link with those changes in place. Do not treat
+them as solved until a run gets past `LD vmlinux`.
 
 My own patch broke the build it was meant to fix. The guard comment ended with
 a bare `/*` line:
