@@ -230,6 +230,14 @@ jobs:
       - name: Package artifacts
         run: bash scripts/package.sh all
 
+      # Repacks the stock boot image with the kernel this run just built, for
+      # flashing with Odin. Guarded on the config flag so a profile that does
+      # not want it is unaffected, and placed before the uploads so a failure
+      # here cannot cost the artifacts that already exist.
+      - name: Build Odin boot image
+        if: env.BUILD_ODIN_BOOT_IMG == 'true'
+        run: bash scripts/odinboot.sh
+
       - name: Export build metadata
         id: meta
         run: |
@@ -269,6 +277,14 @@ jobs:
         with:
           name: boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
           path: kernel_workspace/boot.img
+
+      - name: Upload Odin boot image
+        if: env.ODIN_BOOT_IMAGE_IS_OK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/new-boot.img
+          if-no-files-found: error
 
   # Publishing is a separate job so the build itself runs with a read-only
   # token; only this job gets contents:write, and only when asked for.

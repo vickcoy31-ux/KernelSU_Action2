@@ -82,6 +82,12 @@ declare -A DEFAULTS=(
 	[BUILD_BOOT_IMG]="false"
 	[SOURCE_BOOT_IMAGE]=""
 
+	# Odin: repack the stock boot image with this build's kernel
+	[BUILD_ODIN_BOOT_IMG]="false"
+	[ODIN_BOOT_SOURCE_URL]=""
+	[ODIN_BOOT_SOURCE_SHA256]=""
+	[MAGISK_APK_URL]=""
+
 	# Runner
 	[ENABLE_CCACHE]="true"
 	[REMOVE_UNUSED_PACKAGES]="true"
@@ -222,6 +228,17 @@ validate() {
 
 	if is_true "${CFG[BUILD_BOOT_IMG]}" && [ -z "${CFG[SOURCE_BOOT_IMAGE]}" ]; then
 		_err "BUILD_BOOT_IMG=true requires SOURCE_BOOT_IMAGE"
+	fi
+
+	# A repack is only safe against the exact firmware it was verified on, so
+	# the source image and its checksum are both required, not merely advised.
+	if is_true "${CFG[BUILD_ODIN_BOOT_IMG]}"; then
+		[ -n "${CFG[ODIN_BOOT_SOURCE_URL]}" ] ||
+			_err "BUILD_ODIN_BOOT_IMG=true requires ODIN_BOOT_SOURCE_URL"
+		[ -n "${CFG[ODIN_BOOT_SOURCE_SHA256]}" ] ||
+			_err "BUILD_ODIN_BOOT_IMG=true requires ODIN_BOOT_SOURCE_SHA256 (sha256 of that image)"
+		[ -n "${CFG[MAGISK_APK_URL]}" ] ||
+			_err "BUILD_ODIN_BOOT_IMG=true requires MAGISK_APK_URL (magiskboot is taken from the APK)"
 	fi
 
 	if is_true "${CFG[USE_CUSTOM_CLANG]}" && [ -z "${CFG[CUSTOM_CLANG_SOURCE]}" ]; then
