@@ -1,0 +1,58 @@
+connectivity: call show_stack() with the signature this tree declares
+
+drivers/misc/mediatek/connectivity/common/connectivity_build_in_adapter.c
+calls show_stack with two arguments, but include/linux/sched/debug.h in this
+tree declares
+
+    extern void show_stack(struct task_struct *task, unsigned long *sp,
+                           const char *loglvl);
+
+and kernel/sched/core.c already calls it that way:
+
+    show_stack(p, NULL, KERN_INFO);
+
+so the file is written against a different generation of the kernel than the
+one it is being built in. The build stops on all three call sites:
+
+    connectivity_build_in_adapter.c:72:20: error: too few arguments to
+        function call, expected 3, have 2
+    connectivity_build_in_adapter.c:274:21: error: too few arguments to
+        function call, expected 3, have 2
+    connectivity_build_in_adapter.c:279:25: error: too few arguments to
+        function call, expected 3, have 2
+
+Passing KERN_INFO makes the log level explicit. The previous two-argument form
+passed 0, which suppresses output, so this turns three stack traces on in the
+connectivity driver rather than hiding anything. Nothing about the function
+changes: same task, same stack pointer, and a log level that the caller of a
+crash reporter wants to see anyway.
+
+The alternative was CONFIG_MTK_COMBO=n, which does not touch the source but
+CONFIG_MTK_COMBO is the WiFi and Bluetooth combo chip, so the tablet would
+build with no wireless at all. A tablet without WiFi does not do much, and
+three lines of log output is not a cost worth that.
+
+--- a/drivers/misc/mediatek/connectivity/common/connectivity_build_in_adapter.c
++++ b/drivers/misc/mediatek/connectivity/common/connectivity_build_in_adapter.c
+@@ -69,7 +69,7 @@ struct connsys_state_info g_connsys_state_info;
+ void connectivity_export_show_stack(struct task_struct *tsk, unsigned long *sp)
+ {
+ #ifdef CFG_CONNADP_BUILD_IN
+-	show_stack(tsk, sp);
++	show_stack(tsk, sp, KERN_INFO);
+ #else
+ 	pr_info("%s not support in connadp.ko\n", __func__);
+ #endif
+@@ -271,12 +271,12 @@ static void dump_task(void *ignore, struct task_struct *p, struct pt_regs *regs)
+ 		pr_info("cpu=%d on_cpu=%d ", cpu, p->on_cpu);
+-		show_stack(p, NULL);
++		show_stack(p, NULL, KERN_INFO);
+ 		pr_info("CPU%d curr=%d:%-15.15s preempt_count=0x%x", cpu,
+ 			curr->pid, curr->comm, ti->preempt_count);
+ 
+ 		if (state == TASK_RUNNING && curr != p)
+-			show_stack(curr, NULL);
++			show_stack(curr, NULL, KERN_INFO);
+ 
+ 		break;
+ 	}

@@ -381,6 +381,39 @@ resukisu_sys_enter_patch() {
 	fi
 }
 
+# -------------------------------------------------------- gta9: show_stack ---
+
+# connectivity_build_in_adapter.c is written against a different generation of
+# the kernel than the one it is built in. It calls show_stack() with two
+# arguments; include/linux/sched/debug.h in this tree declares
+#
+#     extern void show_stack(struct task_struct *task, unsigned long *sp,
+#                            const char *loglvl);
+#
+# and kernel/sched/core.c already calls it that way, so the file is the odd one
+# out rather than the header being wrong.
+#
+# The alternative is CONFIG_MTK_COMBO=n, which needs no source change at all,
+# and that is why this is not the first thing tried: CONFIG_MTK_COMBO is the
+# WiFi and Bluetooth combo chip, and a tablet that builds but cannot connect to
+# a network is not a working tablet. Passing KERN_INFO makes three stack traces
+# in the connectivity driver visible where the two-argument form suppressed
+# them by passing 0; the calls do the same work either way.
+gta9_show_stack_signature_patch() {
+	group "gta9: show_stack() call signature"
+	local p="${REPO_ROOT}/patches/gta9-connectivity-show-stack-signature.patch"
+	local target="${KERNEL_DIR}/drivers/misc/mediatek/connectivity/common/connectivity_build_in_adapter.c"
+	[ -f "$p" ] || { warn "show_stack signature patch not found at ${p}"; endgroup; return 0; }
+	# This is a fix for one tree, not a general requirement. A tree without the
+	# MediaTek connectivity driver has nothing to fix, and a tree that has it
+	# already on the three-argument form is left alone by apply_patch. Dying
+	# here would make an unrelated profile fail on a file it never had.
+	[ -f "$target" ] || { info "no connectivity_build_in_adapter.c in this tree; skipping"; endgroup; return 0; }
+	( cd "$KERNEL_DIR" && apply_patch "$p" 1 ) \
+		|| die "could not make show_stack() calls match this tree's declaration"
+	endgroup
+}
+
 # --------------------------------------------------------------------- main ---
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -389,6 +422,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		path_umount)  path_umount_apply ;;
 		hide_stuff)   hide_stuff_apply ;;
 		hooks)        hooks_patch_apply ;;
+		show_stack)   gta9_show_stack_signature_patch ;;
 		kpm)          kpm_patch_image "$2" ;;
 		all)
 			# Order matters and this is the tested one (4.19 + SukiSU builtin
@@ -407,6 +441,11 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 
 			# ReSukiSU tracepoint compat (always safe in tracepoint mode).
 			resukisu_sys_enter_patch
+
+			# Only needed for this tree: the connectivity driver calls
+			# show_stack() with two arguments and the header here takes three.
+			# Idempotent, and a no-op on trees that do not have the file.
+			gta9_show_stack_signature_patch
 
 			if is_true "${ENABLE_SUSFS:-false}";      then susfs_apply;      fi
 			if is_true "${ENABLE_HIDE_STUFF:-false}"; then hide_stuff_apply; fi
