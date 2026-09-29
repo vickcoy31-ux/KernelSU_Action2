@@ -116,16 +116,23 @@ stage_stock_boot() {
 	# a boot loop, and both files are called "boot.img" and both are valid
 	# boot images, so nothing downstream can tell them apart. Pin the exact
 	# firmware this profile is built against.
+	#
+	# Both sides are lowercased first. sha256sum prints hex in lowercase, and
+	# a hash written in uppercase in config.env is the same hash; comparing
+	# them as-is rejects a correct file, which is a worse failure than not
+	# checking at all because it looks like tampering.
 	if [ -n "${ODIN_BOOT_SOURCE_SHA256:-}" ]; then
-		local got
+		local got want
 		got=$(sha256sum "$lz4file" | cut -d' ' -f1)
-		if [ "$got" != "${ODIN_BOOT_SOURCE_SHA256}" ]; then
+		got=${got,,}
+		want=${ODIN_BOOT_SOURCE_SHA256,,}
+		if [ "$got" != "$want" ]; then
 			die "stock boot image does not match the pinned firmware.
-    expected ${ODIN_BOOT_SOURCE_SHA256}
+    expected ${want}
     got      ${got}
     Refusing to repack: this is not the firmware this build is pinned to."
 		fi
-		ok "stock boot image matches the pinned firmware"
+		ok "stock boot image matches the pinned firmware (${got})"
 	fi
 
 	lz4 -d -f "$lz4file" "$boot" || die "lz4 could not decompress the stock boot image"

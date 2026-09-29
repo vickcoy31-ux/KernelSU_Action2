@@ -250,7 +250,12 @@ jobs:
             echo "susfs_version=${SUSFS_VERSION:-}"
           } >> "$GITHUB_OUTPUT"
 
+      # always(): a failure in a later step must not cost the artefacts that
+      # already exist. The kernel image and the AnyKernel3 package are the
+      # expensive output of a 16-minute build; a packaging problem downstream
+      # should not throw them away and force a second build to get them back.
       - name: Upload kernel image
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.KERNEL_IMAGE_NAME }}${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
@@ -258,6 +263,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload AnyKernel3
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: AnyKernel3${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
@@ -279,7 +285,7 @@ jobs:
           path: kernel_workspace/boot.img
 
       - name: Upload Odin boot image
-        if: env.ODIN_BOOT_IMAGE_IS_OK == 'true'
+        if: always() && env.ODIN_BOOT_IMAGE_IS_OK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: new-boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
