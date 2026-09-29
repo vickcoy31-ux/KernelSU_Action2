@@ -167,6 +167,55 @@ repack() {
 	export_env ODIN_BOOT_IMAGE_IS_OK true
 }
 
+# ------------------------------------------------------------ verification ---
+
+# The whole point of this script is that one thing changes and nothing else
+# does. A repack that also rewrites the ramdisk, drops a DTB or alters the
+# kernel command line still produces a boot image that passes every magic
+# check and is still accepted by the bootloader -- the failure only shows up
+# later, as a tablet that does not boot, with nothing in the Odin log to
+# explain it. So unpack both images and compare them component by component.
+verify_only_kernel_changed() {
+	group "Verifying that only the kernel changed"
+	local base="${OUT}/verify"
+	rm -rf "$base"
+	mkdir -p "${base}/stock" "${base}/new"
+
+	( cd "${base}/stock" && "${OUT}/magiskboot" unpack "${OUT}/boot.img" ) \
+		|| die "could not unpack the stock boot image to compare it"
+	( cd "${base}/new" && "${OUT}/magiskboot" unpack "${OUT}/new-boot.img" ) \
+		|| die "could not unpack the repacked boot image to compare it"
+
+	local unexpected=0 rel
+	while IFS= read -r rel; do
+		if [ ! -f "${base}/new/${rel}" ]; then
+			warn "component present in the stock image only: ${rel}"
+			unexpected=$((unexpected + 1))
+		elif [ "$rel" = "kernel" ]; then
+			continue
+		elif ! cmp -s "${base}/stock/${rel}" "${base}/new/${rel}"; then
+			warn "component changed but was not meant to: ${rel}"
+			unexpected=$((unexpected + 1))
+		fi
+	done < <(cd "${base}/stock" && find . -type f -printf '%P\n' | sort)
+
+	while IFS= read -r rel; do
+		if [ ! -f "${base}/stock/${rel}" ]; then
+			warn "component appeared in the repacked image: ${rel}"
+			unexpected=$((unexpected + 1))
+		fi
+	done < <(cd "${base}/new" && find . -type f -printf '%P\n' | sort)
+
+	if [ "$unexpected" -ne 0 ]; then
+		die "${unexpected} component(s) differ between the stock and the repacked boot image.
+    Only the kernel was meant to be replaced. A changed ramdisk, dtb or
+    command line is a boot loop Odin will not explain, so this is not handed over."
+	fi
+
+	ok "only the kernel differs; every other component is byte-identical"
+	endgroup
+}
+
 write_summary() {
 	summary ""
 	summary "### Odin boot image"
@@ -188,6 +237,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 	stage_magiskboot
 	stage_stock_boot
 	repack
+	verify_only_kernel_changed
 	write_summary
 	ok "done"
 fi
