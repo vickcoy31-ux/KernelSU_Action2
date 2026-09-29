@@ -75,7 +75,25 @@ make_boot_image() {
 	[ -x "${tools}/unpack_bootimg.py" ] || [ -f "${tools}/unpack_bootimg.py" ] \
 		|| die "mkbootimg tools not found at ${tools}"
 
-	fetch "${SOURCE_BOOT_IMAGE:?SOURCE_BOOT_IMAGE required}" "${WORKSPACE}/boot-source.img"
+	# SOURCE_BOOT_IMAGE may be a local path or a URL. fetch() is curl-only, and
+	# the stock boot image is committed in this repository, so the local case has
+	# to work without a web host. A relative path is resolved against the
+	# repository root rather than the current directory: the workflow invokes
+	# this script from there, but this function chdir's to $WORKSPACE a few lines
+	# below, so relying on CWD would be fragile.
+	local src="${SOURCE_BOOT_IMAGE:?SOURCE_BOOT_IMAGE required}"
+	case "$src" in
+		/*) ;;
+		*://*) ;; # a URL; leave it alone so fetch can use it as-is
+		*) src="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/$src" ;;
+	esac
+	if [ -f "$src" ]; then
+		cp "$src" "${WORKSPACE}/boot-source.img" \
+			|| die "could not read the stock boot image from ${src}"
+		info "stock boot image: ${src} ($(du -h "$src" | cut -f1))"
+	else
+		fetch "$src" "${WORKSPACE}/boot-source.img"
+	fi
 
 	cd "$WORKSPACE"
 	local fmt
