@@ -27,10 +27,34 @@ OUT="${KERNEL_DIR}/out"
 # the filesystem, so that the same KERNEL_CONFIG works on a runner and on a
 # laptop.
 REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+CONFIG_DIR="${KERNEL_DIR}/arch/${ARCH}/configs"
 case "$KERNEL_CONFIG" in
-	/*) DEFCONFIG_PATH="${REPO_ROOT}/${KERNEL_CONFIG#/}" ;;
-	*)  DEFCONFIG_PATH="${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}" ;;
+	/*)
+		# A config belonging to this repository, named with a leading slash.
+		#
+		# It has to end up inside the kernel tree regardless, because KERNEL_CONFIG
+		# is handed to make as the target name:
+		#
+		#   make -C out ... /config/gta9_stock.config
+		#   mkdir: cannot create directory '/config': Permission denied
+		#   ../scripts/kconfig/Makefile:93: No configuration exists for this
+		#   target on this architecture.  Stop.
+		#
+		# make reads the leading slash as the filesystem root, not as a reference
+		# to this repository, so resolving the path here is not enough -- the
+		# basename is what make has to see. Copy it into configs/ and rewrite
+		# KERNEL_CONFIG to the name make will resolve, which is how every upstream
+		# defconfig is reached anyway.
+		DEFCONFIG_PATH="${REPO_ROOT}/${KERNEL_CONFIG#/}"
+		KERNEL_CONFIG="$(basename "$DEFCONFIG_PATH")"
+		DEFCONFIG_STAGED="$CONFIG_DIR/${KERNEL_CONFIG}"
+		;;
+	*)
+		DEFCONFIG_PATH="${CONFIG_DIR}/${KERNEL_CONFIG}"
+		DEFCONFIG_STAGED=
+		;;
 esac
+export KERNEL_CONFIG
 
 # ------------------------------------------------------------- defconfig ---
 
@@ -39,12 +63,10 @@ prepare_defconfig() {
 	set -x
 	info "kernel dir : ${KERNEL_DIR}"
 	info "defconfig  : ${DEFCONFIG_PATH}"
-	# Only the kernel tree's own configs/ needs to exist. A defconfig supplied
-	# by this repository is not required to live there, so only look for the
-	# directory when that is where the file is being read from.
-	if [ "$DEFCONFIG_PATH" = "${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}" ] \
-		&& [ ! -d "${KERNEL_DIR}/arch/${ARCH}/configs" ]; then
-		warn "configs directory is missing: ${KERNEL_DIR}/arch/${ARCH}/configs"
+	# Only the kernel tree's own configs/ needs to exist, and it is where every
+	# defconfig is read from once the path has been resolved above.
+	if [ ! -d "$CONFIG_DIR" ]; then
+		warn "configs directory is missing: ${CONFIG_DIR}"
 		warn "contents of ${KERNEL_DIR}/arch/${ARCH}:"
 		ls -la "${KERNEL_DIR}/arch/${ARCH}" 2>&1 | head -30 || true
 		die "defconfig directory not found; is the kernel source cloned?"
@@ -55,8 +77,19 @@ prepare_defconfig() {
 		# kernel's configs/ for a bare name and this repository for a path.
 		warn "looked in : $(dirname "$DEFCONFIG_PATH")"
 		ls -la "$(dirname "$DEFCONFIG_PATH")" 2>&1 | head -40 || true
-		die "defconfig not found: ${KERNEL_CONFIG} (resolved to ${DEFCONFIG_PATH})"
+		die "defconfig not found: ${DEFCONFIG_PATH}"
 	fi
+
+	# Put it where make expects to find it, and say so, because a config that
+	# is copied here is no longer the file in git: everything below this point
+	# rewrites the staged copy, not the committed one.
+	if [ -n "$DEFCONFIG_STAGED" ]; then
+		cp "$DEFCONFIG_PATH" "$DEFCONFIG_STAGED" \
+			|| die "could not stage ${DEFCONFIG_PATH} into ${DEFCONFIG_STAGED}"
+		info "staged into the kernel tree: ${DEFCONFIG_STAGED}"
+		DEFCONFIG_PATH="$DEFCONFIG_STAGED"
+	fi
+
 	cp "$DEFCONFIG_PATH" "${WORKSPACE}/defconfig.orig"
 	set +x
 
