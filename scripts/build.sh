@@ -840,6 +840,60 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 26. Four MML tile-processor variants all build at once (run #84).
+	#     Run #84 compiled the whole tree cleanly for the first time -- 0 compile
+	#     errors, 0 undefined symbols, and the link was reached. The only thing
+	#     left was 9 duplicate symbols, all from this directory:
+	#         mml_dual, mml_force_rsz, mml_path_mode, mml_path_swap,
+	#         mml_racing, mml_racing_rsz
+	#     >>> defined at mtk-mml-tp-mt6893.c / mt6895.c / mt6879.c / mt6983.c
+	#     all in drivers/gpu/drm/mediatek/mml/, all in archive drivers/built-in.a
+	#
+	#     This is the same multi-platform shape as patches 3 and 4. The Makefile
+	#     has four blocks guarded only by a file-existence wildcard:
+	#         ifneq ($(wildcard $(srctree)/$(src)/mtk-mml-tp-mt6893.c),)
+	#         obj-$(CONFIG_MTK_MML) += mtk-mml-mt6893.o
+	#         mtk-mml-mt6893-objs := mtk-mml-tp-mt6893.o
+	#         endif
+	#     All four .c files exist, so all four objects are added. The vendor
+	#     kernel is a module build, where each is a separate .ko and identical
+	#     symbol names in different modules are legal. Linked monolithically
+	#     they are one namespace, so the six shared globals collide. The six are
+	#     module_param tuning knobs -- force resizing, dual mode, path swap/mode,
+	#     racing mode -- not code.
+	#
+	#     Verified before choosing which to keep:
+	#       - none of the six symbols is referenced anywhere else. All 40 other
+	#         .c/.h files in mml/ were checked; zero hits. The core's
+	#         mml_racing_ut / _timeout / _urgent / _sleep are different symbols.
+	#       - no header in mml/ declares anything from a tp file, and none of the
+	#         four declares a `compatible` or registers a platform_driver, so the
+	#         files are leaves: nothing links against them.
+	#       - each file hard-codes its own chip with #define TOPOLOGY_PLATFORM
+	#         "mtXXXX" and includes its own dt-bindings/mml/mml-mtXXXX.h, so the
+	#         four really are four independent implementations.
+	#       - there is no mt6789 variant, and mtk-mml-tp-mt6789.c is a 404.
+	#
+	#     GTA9 is MT6789. mt6879 is the closest generation present, so that is
+	#     the one kept. It will not probe on this hardware, which is the honest
+	#     outcome: this tree ships no MML tile-processor implementation for
+	#     MT6789. mediatek_v2 does have a chip-specific file for it,
+	#     platform/mtk_drm_6789.o, and that one is still built.
+	local mml_mk="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mml/Makefile"
+	if [ -f "$mml_mk" ]; then
+		local tp_soc
+		for tp_soc in mt6893 mt6895 mt6983; do
+			if grep -q "mtk-mml-tp-${tp_soc}\.c" "$mml_mk"; then
+				sed -i "/ifneq (\$(wildcard \$(srctree)\/\$(src)\/mtk-mml-tp-${tp_soc}\.c),)/,/^[[:space:]]*endif\$/d" "$mml_mk"
+			fi
+		done
+		if grep -q 'mtk-mml-tp-mt689[35]\.c\|mtk-mml-tp-mt6983\.c' "$mml_mk"; then
+			warn "MML: a non-MT6789 tp variant survived; the duplicate symbols will return"
+		else
+			info "MML: dropped the mt6893/mt6895/mt6983 tp variants, kept mt6879 (closest to MT6789)"
+		fi
+	fi
+
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
 	#     after 20 errors and says so:
 	#         ld.lld: error: too many errors emitted, stopping now
