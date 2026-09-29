@@ -733,6 +733,47 @@ prepare_defconfig() {
 		warn "ELEVATOR: task_is_booster present but the pattern did not match; leaving it alone"
 	fi
 
+	# 23. mtk_drm_fbdev.c does not compile against its own struct (run #82).
+	#     Turning on DRM worked: run #82 got past the whole display stack and
+	#     failed on 4 compile errors, all in this one file, all of one kind:
+	#         mtk_drm_fbdev.c:372:11: error: no member named 'fbdev_bo'
+	#                                in 'struct mtk_drm_private'
+	#         mtk_drm_fbdev.c:382:55: error: no member named 'fbdev_bo'
+	#         mtk_drm_fbdev.c:458:40: error: no member named 'fb_helper'
+	#         mtk_drm_fbdev.c:499:40: error: no member named 'fb_helper'
+	#     struct mtk_drm_private is in mtk_drm_drv.h:89-188 and neither member
+	#     exists there, under any #ifdef -- the only conditional inside the
+	#     struct is #ifdef DRM_MMPATH around HWC_gpid. mtk_drm_drv.h does
+	#     include <drm/drm_fb_helper.h> at line 9, so struct drm_fb_helper is a
+	#     known type; the members were simply never added to this header.
+	#     This is upstream drift: the .c was written against a struct that has
+	#     since lost the two fields. It is not a config problem and no Kconfig
+	#     value reaches it.
+	#
+	#     The two fields belong to the fbdev emulation path, and that path is
+	#     optional: Makefile:77 gates the object itself,
+	#         mediatek-drm-$(CONFIG_DRM_FBDEV_EMULATION) += mtk_drm_fbdev.o
+	#     and mtk_drm_fbdev.h:18-27 already provides a no-op mtk_fbdev_init()
+	#     and mtk_fbdev_fini() for the #else case. Android on this device goes
+	#     through the DRM fbdev emulation in userspace, not through this MTK
+	#     helper, and nothing in the tree calls mtk_fbdev_init() anyway --
+	#     mtk_drm_drv.c has no reference to fbdev at all. So the whole object is
+	#     dead code here, and the clean fix is to stop building it rather than
+	#     to invent two struct members.
+	#
+	#     The .config line is dropped from EXTRA_DEFCONFIG in the same commit, so
+	#     this patch only has to make the Makefile agree. Both halves are needed:
+	#     a build.sh edit alone would leave a =y that pulls the object back in.
+	local drm_mk="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mediatek_v2/Makefile"
+	if [ -f "$drm_mk" ] && grep -q 'mediatek-drm-\$(CONFIG_DRM_FBDEV_EMULATION) += mtk_drm_fbdev\.o' "$drm_mk"; then
+		sed -i 's#^mediatek-drm-\$(CONFIG_DRM_FBDEV_EMULATION) += mtk_drm_fbdev\.o$##' "$drm_mk"
+		if grep -q 'mtk_drm_fbdev\.o' "$drm_mk"; then
+			warn "DRM_FBDEV: mtk_drm_fbdev.o still referenced in the Makefile"
+		else
+			info "DRM_FBDEV: stopped building mtk_drm_fbdev.o (it needs two struct members this tree does not have)"
+		fi
+	fi
+
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
 	#     after 20 errors and says so:
 	#         ld.lld: error: too many errors emitted, stopping now
