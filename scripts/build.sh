@@ -894,6 +894,41 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 27. task_is_booster, second call site (run #86).
+	#     Run #85 fixed the one in block/elevator.c. Turning CPU_FREQ on in run
+	#     #86 built drivers/cpufreq/cpufreq.o for the first time, and it has the
+	#     same pair:
+	#         cpufreq.c:785  bool task_is_booster(struct task_struct *tsk);
+	#         cpufreq.c:796      if (task_is_booster(current))
+	#                              return -EINVAL;
+	#         ld.lld: error: undefined symbol: task_is_booster
+	#         >>> referenced by cpufreq.c
+	#         >>>               cpufreq/cpufreq.o:(store_scaling_governor)
+	#
+	#     The same reasoning as patch 22 applies, and the search there was not
+	#     limited to the scheduler: all 32,491 .c/.h files under drivers/ were
+	#     scanned for the string "booster", and the only hits are
+	#     drivers/input/{evdev_booster.c,input_booster.c,input_booster_mtk.c},
+	#     drivers/regulator/stm32-booster.c and the stm32 devicetree binding.
+	#     This tree has no definition of task_is_booster, so the call can never
+	#     resolve while CONFIG_CPU_FREQ is on.
+	#
+	#     The code is written so a tree that does define it is left alone: both
+	#     the declaration and the call are matched together, and if a definition
+	#     ever appears this patch is what should be dropped.
+	local cpufreq_c="${KERNEL_DIR}/drivers/cpufreq/cpufreq.c"
+	if [ -f "$cpufreq_c" ] && grep -q '^bool task_is_booster(struct task_struct \*tsk);$' "$cpufreq_c"; then
+		sed -i '/^bool task_is_booster(struct task_struct \*tsk);$/d' "$cpufreq_c"
+		sed -i '/^\tif (task_is_booster(current))$/,+1d' "$cpufreq_c"
+		if grep -q 'task_is_booster' "$cpufreq_c"; then
+			warn "CPUFREQ: task_is_booster still referenced after removal"
+		else
+			info "CPUFREQ: removed the call to task_is_booster (no definition exists in this tree)"
+		fi
+	elif [ -f "$cpufreq_c" ] && grep -q 'task_is_booster' "$cpufreq_c"; then
+		warn "CPUFREQ: task_is_booster present but the pattern did not match; leaving it alone"
+	fi
+
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
 	#     after 20 errors and says so:
 	#         ld.lld: error: too many errors emitted, stopping now
