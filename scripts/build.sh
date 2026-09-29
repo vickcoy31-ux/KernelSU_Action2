@@ -774,6 +774,72 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 24. mediatek_v2 imposes its own -Werror, which outranks KCFLAGS (run #83).
+	#     include/soc/mediatek/mmqos.h:61 trips it:
+	#         mtk_mmqos_hrt_scen(enum hrt_scen, bool is_start) { return 0; }
+	#         omitting the parameter name in a function definition is a C2x extension
+	#         [-Werror,-Wc2x-extensions]
+	#     That header is full of such stubs, and line 51 does name its parameter
+	#     while line 61 does not, so this is an oversight rather than an
+	#     intentional extension.
+	#
+	#     KCFLAGS cannot catch it. In Kbuild the per-directory flags come last:
+	#         __c_flags = $(KBUILD_CFLAGS) $(KCFLAGS) $(EXTRA_CFLAGS) $(MODCFLAGS)
+	#         c_flags += $(ccflags-y)
+	#     so a `subdir-ccflags-y += -Werror` in a local Makefile is passed AFTER
+	#     the global -Wno-error and wins. That is why DISABLE_CC_WERROR=true and
+	#     the ten -Wno-error= entries in KCFLAGS have no effect here, and it is
+	#     the same class of trap as patches 19 and 20: something that looks like
+	#     a global setting but is actually local.
+	#
+	#     Checked first: of the Makefiles under drivers/gpu/drm/mediatek/ only
+	#     this one carries -Werror, so this is the whole of it and not the first
+	#     of many.
+	local drmv2_mk="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mediatek_v2/Makefile"
+	if [ -f "$drmv2_mk" ] && grep -q '^subdir-ccflags-y += -Werror$' "$drmv2_mk"; then
+		sed -i 's/^subdir-ccflags-y += -Werror$/subdir-ccflags-y += -Wno-error/' "$drmv2_mk"
+		if grep -q '^subdir-ccflags-y += -Wno-error$' "$drmv2_mk"; then
+			info "DRM_MEDIATEK_V2: local -Werror neutralised so KCFLAGS governs again"
+		else
+			warn "DRM_MEDIATEK_V2: -Werror rewrite did not verify"
+		fi
+	fi
+
+	# 25. mtk_dramc.h is not in this tree (run #83).
+	#     mtk_layering_rule.c:19-21:
+	#         #if defined(CONFIG_MTK_DRAMC)
+	#         #include "mtk_dramc.h"
+	#         #endif
+	#         fatal error: 'mtk_dramc.h' file not found
+	#     CONFIG_MTK_DRAMC is =m in both defconfigs, so transposition makes it y.
+	#     The real driver builds fine from it -- drivers/memory/mediatek/Makefile:12
+	#     is obj-$(CONFIG_MTK_DRAMC) += mtk_dramc.o, and dramc.c and dramc_bin.c
+	#     both exist there -- so the symbol must stay y. What is missing is the
+	#     *header* the display driver expects, and the path it searches is
+	#         ccflags-y += -I$(srctree)/drivers/misc/mediatek/dramc/$(MTK_PLATFORM)
+	#     at Makefile:89. That directory does not exist in this repository; the
+	#     vendor platform build supplies it from an external module blob. The only
+	#     related header present is include/soc/mediatek/dramc.h, and it is named
+	#     dramc.h, not mtk_dramc.h.
+	#
+	#     The include is dead: across all 894 lines of mtk_layering_rule.c the
+	#     only two mentions of dramc are the #if and the #include itself.
+	#     Nothing from that header is referenced, so dropping the guarded block
+	#     costs no behaviour. Pinning CONFIG_MTK_DRAMC=n would also have
+	#     compiled, but it would throw away the DRAM calibration driver that does
+	#     build, in order to work around an include that references nothing.
+	local layer_c="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mediatek_v2/mtk_layering_rule.c"
+	if [ -f "$layer_c" ] && grep -q '^#include "mtk_dramc\.h"$' "$layer_c"; then
+		local layer_before
+		layer_before=$(wc -l < "$layer_c")
+		sed -i '/^#if defined(CONFIG_MTK_DRAMC)$/,/^#endif$/d' "$layer_c"
+		if grep -q 'mtk_dramc' "$layer_c"; then
+			warn "DRM_LAYERING: mtk_dramc still referenced after removing the include"
+		else
+			info "DRM_LAYERING: removed the dead mtk_dramc.h include (${layer_before} -> $(wc -l < "$layer_c") lines)"
+		fi
+	fi
+
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
 	#     after 20 errors and says so:
 	#         ld.lld: error: too many errors emitted, stopping now
