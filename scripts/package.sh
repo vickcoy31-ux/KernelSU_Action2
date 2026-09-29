@@ -41,6 +41,21 @@ make_anykernel3() {
 		sed -i 's/IS_SLOT_DEVICE=0;/is_slot_device=auto;/g' "${AK3}/anykernel.sh"
 	fi
 
+	# kernel.string is shown by the recovery banner, and upstream leaves it as
+	# "ExampleKernel by osm0sis". That is the template's placeholder, not a
+	# description of this build, and it is the one line of the zip a user reads
+	# before flashing. device.name1..4 are deliberately left alone: with
+	# do.devicecheck=0 above they are inert, read only for the banner text and
+	# never compared against ro.product.device, so putting a guessed codename
+	# there would be decoration that says nothing true.
+	local ak3_string="${AK3_KERNEL_STRING:-ReSukiSU kernel}"
+	sed -i "s|^kernel\.string=.*|kernel.string=${ak3_string}|" "${AK3}/anykernel.sh"
+	if grep -q "^kernel\.string=${ak3_string}\$" "${AK3}/anykernel.sh"; then
+		info "AK3: kernel.string set to '${ak3_string}'"
+	else
+		warn "AK3: kernel.string rewrite did not verify"
+	fi
+
 	cp "${BOOT_OUT}/${KERNEL_IMAGE_NAME}" "${AK3}/" \
 		|| die "kernel image missing at ${BOOT_OUT}/${KERNEL_IMAGE_NAME}"
 	if is_true "${CHECK_DTBO_IS_OK:-false}"; then
