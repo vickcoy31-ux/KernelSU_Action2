@@ -8,6 +8,40 @@ attempt does not repeat an approach that was already shown to fail. Update this
 file in the same commit that changes `config.env`, `scripts/build.sh`, or the
 workflows.
 
+## STATUS: the build works
+
+**Run #88 (commit `3cab9e6`) and run #89 (commit `2148478`) both succeeded.**
+
+```
+compile error        0
+duplicate symbol     0
+undefined symbol     0
+implicit declaration 0
+##[error]            0
+
+SYSMAP   System.map
+OBJCOPY  arch/arm64/boot/Image
+GZIP     arch/arm64/boot/Image.gz
+[+] kernel image: Image.gz (8.0M)
+[+] kernel release: 5.10.205-ga5002f750537-dirty
+```
+
+Artifacts produced: a flashable `AnyKernel3-*.zip` (11.4 MB), the bare
+`Image.gz` (8,308,668 bytes, gzip magic `1F 8B 08 00` confirmed) and the
+resolved `.config`.
+
+It took 88 runs. The 87 before this one never produced a kernel image. **This
+file is kept as-is on purpose:** every entry below is the record of an approach
+that was tried and shown to fail, and that record is what made the 88th run
+possible. Read §5 onwards for the shape of the failures before changing anything.
+
+Nothing here is untested any more. The one part that has **not** been exercised
+is the device itself — nobody has flashed this zip to an SM-X110 and booted it.
+If the tablet comes up to a black screen, the first things to look at are
+`NEED_DTBO` (set to `false` in run #88; see §4d for why that tree cannot build
+a `dtbo.img`) and `is_slot_device` in `anykernel.sh`, which is `auto` and may
+need to be `1`.
+
 As of 2026-09-28 the build has **never succeeded**: 61 `Build Kernel` runs,
 57 failures, 0 successes.
 
@@ -843,13 +877,76 @@ consumer loses a driver that was already non-functional, and it is small and
 self-contained, so the blast radius is one Makefile's worth of objects rather
 than an entire subsystem.
 
+It is now `false`. Run #87 built the kernel for the first time and then failed
+in `check_output()` rather than in the build:
+
+```
+[+] kernel image: Image.gz (8.0M)
+[x] NEED_DTBO=true but .../out/arch/arm64/boot/dtbo.img was not produced
+```
+
+No `dtbo.img` can be produced by this source, and it is not a misconfiguration.
+`arch/arm64/boot/dts/mediatek/Makefile` builds overlays from a config-supplied
+list, and in the run-#87 `.config` both halves are inert:
+
+```
+CONFIG_BUILD_ARM64_DTB_OVERLAY_IMAGE=y
+CONFIG_BUILD_ARM64_DTB_OVERLAY_IMAGE_NAMES=""
+```
+
+An empty names list makes `dtbo-y` expand to nothing. The two `dtb-y` lines
+above it are commented out in the source as well:
+
+```make
+#dtb-y += mt6789.dtb
+#dtb-y += mt8781_gta9_eur_open_00.dtb
+```
+
+The vendor defconfig carries no `BUILD_ARM64_DTB_*` line at all — those are set
+by `build.py` in the vendor's platform build, per project, and are not in this
+repository. There is no overlay source in the tree either, and no binary
+`.dtbo` is committed anywhere in the repo.
+
+**Class, and it has now happened twice:** a flag inherited from an xiaoleGun
+config that assumes something the vendor's build system supplies from outside
+the repository. `USE_CUSTOM_ANYKERNEL3=false` behaves the same way in spirit —
+it selects the upstream template rather than this device's. The difference is
+that this one hard-fails, so it was caught.
+
+**The cost, stated plainly:** if the device needs a DTBO flashed alongside the
+kernel, the tablet boots without it. For SM-X110 the kernel is installed with
+the stock DTB, so `false` is the expected value. `CONFIG_MTK_DTBO_FEATURE=y` is
+*set* in the config and has not been traced to any overlay source — that is the
+next thing to check if the display does not come up.
+
+## 4e. Run #87–#88: the build finishes, and the zip has a placeholder
+
+Run #88 is the first green run. Two small things were found in the output rather
+than in a failure.
+
+`NEED_DTBO` was set `false` — §4d.
+
+`anykernel.sh` shipped with `kernel.string=ExampleKernel by osm0sis`, the
+AnyKernel3 template placeholder, which is the one line of the zip a user reads
+on the recovery screen before flashing. `package.sh` now rewrites it, overridable
+with `AK3_KERNEL_STRING`.
+
+The other template leftovers were checked before being left alone.
+`device.name1` through `device.name4` are `maguro`, `toro`, `toroplus`, `tuna` —
+the Galaxy Nexus codenames from upstream's example. With `do.devicecheck=0`,
+which `package.sh` already set, those values are read only for banner text and
+are never compared against `ro.product.device`. They are inert. Writing a
+guessed SM-X110 codename there would be decoration that says nothing true, so
+they stay. The two settings in that file that do matter were already handled and
+are present in the shipped zip: `BLOCK=auto` and `is_slot_device=auto`.
+
 # HANDOVER — picking this up cold
 
 Written so this can be resumed without re-deriving anything.
 
 ## Current state
 
-As of run #77, the last completed run with a trustworthy result:
+As of run #77, the last completed run before the fix campaign, the result was:
 
 ```
 compile error (.c:N:N: error:) : 0
@@ -857,13 +954,9 @@ duplicate symbol                : 0
 undefined symbol                : 20
 ```
 
-The build reaches `LD vmlinux` and the link is now free of duplicates. The 20
-undefined symbols are addressed in commit `c89d25c` (see §4c), and run #78 is the
-test of that. What is **not** yet demonstrated is a successful build end to
-end — no run has ever produced a kernel image.
-
-Run #78 has no diagnostic instrumentation active, so its result can be read
-as-is.
+The build reached `LD vmlinux` with the link free of duplicates and 20 undefined
+symbols outstanding. Everything from there to run #88 is in §4c onward. Run #88
+succeeded and run #89 confirmed it.
 
 ## If a build fails, the order that worked
 
@@ -921,6 +1014,26 @@ as-is.
 | 2 `*_3way_semaphore_notifier` | build.sh patch 17, new |
 | `exec_ccci_kern_func_by_md_id` | `CONFIG_MTK_PMIC_PROTECT=n` |
 | `connectivity_register_state_notifier` | `CONFIG_MTK_CONN_SCP=n` |
+| 3 `android_vh` (2nd pass) | `CONFIG_ANDROID_VENDOR_HOOKS=y` (run #79) |
+| 2 `sync_file_*` undefined | `CONFIG_SYNC_FILE=y` (run #79) |
+| `wakeup_source_init` | `CONFIG_PM_WAKELOCKS=y` (run #80) |
+| `scmi_protocol_register` | `CONFIG_ARM_SCMI_PROTOCOL=y` (run #80) |
+| 8 `gpueb_*` undefined | build.sh patch 19 — `obj-m` → `obj-y` |
+| 7 `cmdq_sec_*` undefined | build.sh patch 20 — `ifeq (...,m)` → `ifneq (...)` |
+| `trace_tracing_mark_write` | patch 15 step 2 — the 13 ged call sites |
+| `trace_mtk_pm_qos_update_request` | patch 16 revised — renamed, not deleted |
+| `helper_fp` duplicate | build.sh patch 21 |
+| 4 display undefined | `CONFIG_DRM=y`, `CONFIG_DRM_MEDIATEK=y` (run #82) |
+| `xbc_node_find_value` | `CONFIG_BOOT_CONFIG=y` (run #82) |
+| `mtk_drm_fbdev.c` 4 compile errors | build.sh patch 23 — stop building that object |
+| `mmqos.h` C2x extension | build.sh patch 24 — local `-Werror` neutralised |
+| `mtk_dramc.h` not found | build.sh patch 25 — dead include removed |
+| 6 `mml_*` duplicates | build.sh patch 26 — kept only the mt6879 tp variant |
+| `task_is_booster` ×2 | build.sh patches 22 and 27 |
+| 5 implicit declarations | `CONFIG_CPU_FREQ=y`, `CONFIG_CPU_IDLE=y`, `CONFIG_DEBUG_FS=y` (run #86) |
+| lld's 20-error cap | build.sh patch 18 — `--error-limit=0` |
+| no `dtbo.img` | `NEED_DTBO=false` (run #88) — see §4d |
+| `ExampleKernel` in the zip | `package.sh` sets `kernel.string` (run #89) |
 
 ## Not done, on purpose
 
