@@ -15,7 +15,22 @@ WORKSPACE=${WORKSPACE:-$(cd "${KERNEL_DIR}/.." && pwd)}
 ARCH=${ARCH:-arm64}
 OUT="${KERNEL_DIR}/out"
 
-DEFCONFIG_PATH="${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}"
+# KERNEL_CONFIG normally names a file in the kernel tree's own configs
+# directory, which is where every upstream defconfig lives. A config that does
+# not belong to the tree -- one carrying a device's actual .config, for
+# instance -- can live in this repository instead, and naming it with a path
+# ("config/gta9_stock.config") selects that. Without this, the path is joined
+# onto configs/ and the build stops at "defconfig not found" a minute in,
+# having already spent that minute cloning the source.
+#
+# A leading / is taken as relative to this repository's root rather than to
+# the filesystem, so that the same KERNEL_CONFIG works on a runner and on a
+# laptop.
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+case "$KERNEL_CONFIG" in
+	/*) DEFCONFIG_PATH="${REPO_ROOT}/${KERNEL_CONFIG#/}" ;;
+	*)  DEFCONFIG_PATH="${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}" ;;
+esac
 
 # ------------------------------------------------------------- defconfig ---
 
@@ -24,7 +39,11 @@ prepare_defconfig() {
 	set -x
 	info "kernel dir : ${KERNEL_DIR}"
 	info "defconfig  : ${DEFCONFIG_PATH}"
-	if [ ! -d "${KERNEL_DIR}/arch/${ARCH}/configs" ]; then
+	# Only the kernel tree's own configs/ needs to exist. A defconfig supplied
+	# by this repository is not required to live there, so only look for the
+	# directory when that is where the file is being read from.
+	if [ "$DEFCONFIG_PATH" = "${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}" ] \
+		&& [ ! -d "${KERNEL_DIR}/arch/${ARCH}/configs" ]; then
 		warn "configs directory is missing: ${KERNEL_DIR}/arch/${ARCH}/configs"
 		warn "contents of ${KERNEL_DIR}/arch/${ARCH}:"
 		ls -la "${KERNEL_DIR}/arch/${ARCH}" 2>&1 | head -30 || true
@@ -32,8 +51,11 @@ prepare_defconfig() {
 	fi
 	if [ ! -f "$DEFCONFIG_PATH" ]; then
 		warn "defconfig file is missing: ${DEFCONFIG_PATH}"
-		ls -la "${KERNEL_DIR}/arch/${ARCH}/configs" 2>&1 | head -40 || true
-		die "defconfig not found: arch/${ARCH}/configs/${KERNEL_CONFIG}"
+		# Print the directory the name actually resolved into, which is the
+		# kernel's configs/ for a bare name and this repository for a path.
+		warn "looked in : $(dirname "$DEFCONFIG_PATH")"
+		ls -la "$(dirname "$DEFCONFIG_PATH")" 2>&1 | head -40 || true
+		die "defconfig not found: ${KERNEL_CONFIG} (resolved to ${DEFCONFIG_PATH})"
 	fi
 	cp "$DEFCONFIG_PATH" "${WORKSPACE}/defconfig.orig"
 	set +x
