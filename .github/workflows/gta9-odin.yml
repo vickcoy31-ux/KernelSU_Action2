@@ -1,0 +1,221 @@
+name: gta9 Odin
+
+# The third gta9 workflow, and the reason for it is in the name: this profile
+# produces a boot image for Odin rather than a kernel for inspection. The two
+# before it stay as they are --
+#
+#   gta9-android12.yml   config/gta9_android12.env   run #111, built clean,
+#                                                     but its release string
+#                                                     does not match the
+#                                                     tablet's modules
+#   this one             config/gta9_vermagic.env    the same build with
+#                                                     KERNEL_LOCALVERSION set
+#                                                     to the tablet's own
+#                                                     5.10.205-android12-9-28698995
+#
+# Separate workflow rather than an input on the previous one, and a separate
+# concurrency group below, so a run of this can never cancel a run of that and
+# the histories stay readable. The scripts are the same; only the profile and
+# the intent differ.
+#
+# What makes a kernel usable on a modular device is not that it links. Run #111
+# linked clean -- 0 errors, 0 undefined, 0 duplicate, 0 modpost -- and would
+# still have left the tablet without a single working driver, because
+# /vendor_dlkm holds the .ko files Samsung built and each carries a vermagic
+# that insmod compares against the running kernel. Matching the stock release
+# string is therefore the whole point of this workflow, and the summary below
+# reports the resulting string next to the stock one so that it is checked
+# rather than assumed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Config file to build"
+        required: false
+        default: "config/gta9_vermagic.env"
+        type: string
+
+concurrency:
+  # Deliberately not the gta9-android12 group. Sharing it would let a run of
+  # one workflow cancel a run of the other.
+  group: gta9-odin-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: gta9 (5.10.205-android12-9-28698995, Odin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      WORKSPACE: ${{ github.workspace }}/kernel_workspace
+      CONFIG_ENV: ${{ inputs.config }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      # The tablet's stock release string, read off its own kernel. The build is
+      # expected to report exactly this; the check below fails the run if it
+      # does not, because a mismatch is a boot loop with nothing in the Odin log.
+      STOCK_UTS_RELEASE: 5.10.205-android12-9-28698995
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve configuration
+        run: bash scripts/config.sh
+
+      - name: Record the profile
+        run: |
+          {
+            echo "config        = ${CONFIG_ENV}"
+            echo "source        = ${KERNEL_SOURCE} @ ${KERNEL_SOURCE_BRANCH}"
+            echo "defconfig     = ${KERNEL_CONFIG}"
+            echo "variant       = ${KSU_VARIANT} (${KSU_HOOK_MODE})"
+            echo "localversion  = ${KERNEL_LOCALVERSION:-<from KERNEL_NAME>}"
+            echo "stock release = ${STOCK_UTS_RELEASE}"
+            echo "modules       = $([ "${CONFIG_MODULES:-n}" = n ] && echo off || echo on)"
+            echo "odin image    = ${BUILD_ODIN_BOOT_IMG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Free up disk space
+        if: env.REMOVE_UNUSED_PACKAGES == 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex \
+            git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd \
+            libncurses-dev
+          mkdir -p "$WORKSPACE"
+
+      - name: Set up toolchain
+        run: bash scripts/toolchain.sh
+
+      - name: Fetch kernel source
+        run: bash scripts/source.sh
+
+      - name: Install KernelSU
+        if: env.KSU_VARIANT != 'none'
+        run: bash scripts/kernelsu.sh
+
+      - name: Apply kernel patches
+        run: bash scripts/patches.sh all
+
+      - name: Set up ccache
+        if: env.ENABLE_CCACHE == 'true'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}
+          max-size: 2G
+
+      - name: Build kernel
+        run: bash scripts/build.sh all
+
+      # The three link counts plus the release string. The counts say the build
+      # is sound; the string says the tablet can use it. Both, or the run is
+      # not a deliverable.
+      - name: Report the result
+        if: always()
+        run: |
+          log="${RUNNER_TEMP}/build.log"
+          {
+            echo "### Result"
+            echo
+            undef=$(grep -oE 'undefined symbol: \S+' "$log" 2>/dev/null | awk '{print $3}' | sort -u | wc -l)
+            dup=$(grep -oE 'duplicate symbol: \S+' "$log" 2>/dev/null | awk '{print $3}' | sort -u | wc -l)
+            modpost=$(grep -cE 'ERROR: modpost:' "$log" 2>/dev/null || echo 0)
+            cerr=$(grep -cE '(fatal )?error:' "$log" 2>/dev/null || echo 0)
+            echo "| | count |"
+            echo "| --- | --- |"
+            echo "| compile errors | ${cerr} |"
+            echo "| undefined symbols | ${undef} |"
+            echo "| duplicate symbols | ${dup} |"
+            echo "| modpost errors | ${modpost} |"
+            echo
+            echo "### Release string"
+            echo
+            echo "| | value |"
+            echo "| --- | --- |"
+            echo "| stock tablet | \`${STOCK_UTS_RELEASE}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          img="kernel_workspace/android-kernel/out/arch/${ARCH:-arm64}/boot/Image"
+          if [ -f "$img" ]; then
+            got=$(strings -a "$img" | grep -m1 -oE '^5\.10\.[0-9]+[^ ]*' || true)
+            for cand in "$STOCK_UTS_RELEASE"; do
+              if strings -a "$img" | grep -qF "$cand"; then
+                echo "| built kernel | \`$cand\` (found) |" >> "$GITHUB_STEP_SUMMARY"
+                echo "vermagic: MATCH ($cand)" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "| built kernel | $cand NOT FOUND |" >> "$GITHUB_STEP_SUMMARY"
+                echo "vermagic: MISMATCH -- the tablet's modules will not load" >> "$GITHUB_STEP_SUMMARY"
+                echo "::error::release string $cand not present in the kernel image"
+                exit 1
+              fi
+            done
+            [ -n "$got" ] && echo "first version string seen: $got" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| built kernel | (no Image) |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "compile=$cerr undefined=$undef duplicate=$dup modpost=$modpost"
+
+      - name: Upload resolved kernel config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta9-vermagic-config-${{ env.BUILD_TIME }}
+          path: kernel_workspace/android-kernel/out/.config
+          include-hidden-files: true
+          if-no-files-found: warn
+
+      - name: Package artifacts
+        run: bash scripts/package.sh all
+
+      - name: Build Odin boot image
+        if: env.BUILD_ODIN_BOOT_IMG == 'true'
+        run: bash scripts/odinboot.sh
+
+      - name: Upload kernel image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/android-kernel/out/arch/${{ env.ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }}
+          if-no-files-found: error
+
+      - name: Upload AnyKernel3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/AnyKernel3/*
+          if-no-files-found: error
+
+      - name: Upload Odin boot image
+        if: always() && env.ODIN_BOOT_IMAGE_IS_OK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/new-boot.img
+          if-no-files-found: error

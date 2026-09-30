@@ -1180,7 +1180,32 @@ prepare_defconfig() {
 
 	# A stable LOCALVERSION keeps artifact names predictable. Without this the
 	# tree appends "-dirty" as soon as any patch above touches a tracked file.
-	if [ -n "${KERNEL_NAME:-}" ]; then
+	#
+	# KERNEL_LOCALVERSION overrides the name. It exists because the release
+	# string is not cosmetic on a modular kernel: it is what the module loader
+	# compares. Every .ko on the tablet carries the vermagic its own build
+	# produced, so a kernel whose UTS_RELEASE differs from the stock one is
+	# refused by insmod for every single module:
+	#
+	#   insmod: version magic '5.10.205-android12-9-28698995' should be
+	#           '5.10.205-gta9-ga5002f750537'
+	#
+	# Nothing signs the modules here -- "# CONFIG_MODULE_SIG is not set" in the
+	# stock config -- so the string itself is the only thing standing between a
+	# working tablet and one with no modules at all. Setting KERNEL_LOCALVERSION
+	# to the stock release string makes the kernel report exactly what the
+	# tablet already expects, and the modules load.
+	#
+	# It also turns CONFIG_LOCALVERSION_AUTO off, because with it on
+	# scripts/setlocalversion appends the git describe of this tree ("-ga5002f750537",
+	# or "-dirty" once a patch touches a tracked file) and the string stops
+	# matching again. Pinning a localversion and asking for a moving one is
+	# contradictory, so the pin wins.
+	if [ -n "${KERNEL_LOCALVERSION:-}" ]; then
+		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION "\"${KERNEL_LOCALVERSION}\""
+		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION_AUTO n
+		ok "LOCALVERSION pinned to '${KERNEL_LOCALVERSION}' (LOCALVERSION_AUTO off, no git suffix)"
+	elif [ -n "${KERNEL_NAME:-}" ]; then
 		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION "\"-${KERNEL_NAME}\""
 		if [ -f "${KERNEL_DIR}/scripts/setlocalversion" ]; then
 			sed -i 's/echo "\$res"/echo "\$res"/; s/-dirty//g' "${KERNEL_DIR}/scripts/setlocalversion"
