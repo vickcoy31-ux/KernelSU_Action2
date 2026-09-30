@@ -228,8 +228,25 @@ prepare_defconfig() {
 	#    affect the v4l2 copy. Its subdir-ccflags-y block is deliberately kept --
 	#    it is unrelated to the objects and dropping it would change the include
 	#    path n3d.c is compiled with.
+	#
+	#    Those two copies are separate *modules*, though, which is what makes
+	#    this patch another casualty of the monolithic detour:
+	#        src/common/v1_1/.../frame_sync_drv.mk -> imgsensor_isp6s-objs
+	#            -> imgsensor_isp6s.ko  (CONFIG_MTK_IMGSENSOR=m)
+	#        src-v4l2/frame-sync/frame_sync_drv.mk -> imgsensor-objs
+	#            -> imgsensor.ko        (CONFIG_MTK_V4L2_IMGSENSOR=m)
+	#    Two modules each carrying their own frame_sync.o is ordinary; modpost
+	#    does not compare globals between modules. Only when CONFIG_MODULES=n
+	#    folded both into vmlinux did they collide, which is what run #55/#56
+	#    was about. Applied to a modular build it instead cost a real symbol:
+	#    removing frame_sync.o took FrameSyncInit with it, and n3d.c:691 still
+	#    calls it, so run #108's modpost reported
+	#        ERROR: modpost: "FrameSyncInit" [imgsensor_isp6s.ko] undefined!
+	#    So keep the objects when modules are on -- see modules_on() above.
 	local n3d_fsync_mk="${KERNEL_DIR}/drivers/misc/mediatek/imgsensor/src/common/v1_1/n3d_fsync/frame-sync/frame_sync_drv.mk"
-	if [ -f "$n3d_fsync_mk" ] && grep -q 'LOCAL_FSYNC_PATH)/frame_' "$n3d_fsync_mk"; then
+	if modules_on; then
+		info "IMGSENSOR: skipped, frame-sync objects stay (the v4l2 copy is a separate module)"
+	elif [ -f "$n3d_fsync_mk" ] && grep -q 'LOCAL_FSYNC_PATH)/frame_' "$n3d_fsync_mk"; then
 		sed -i -E '/^imgsensor_isp6s-objs \+=/d; /\$\(LOCAL_FSYNC_PATH\)\/frame_/d' "$n3d_fsync_mk"
 		info "IMGSENSOR: dropped the duplicated frame-sync objects, kept n3d.o"
 	fi
@@ -1040,6 +1057,70 @@ prepare_defconfig() {
 		fi
 	elif [ -f "$cpufreq_c" ] && grep -q 'task_is_booster' "$cpufreq_c"; then
 		warn "CPUFREQ: task_is_booster present but the pattern did not match; leaving it alone"
+	fi
+
+	# 28. task_is_booster, third call site (run #108). Patches 22 and 27 cleared
+	#     elevator.c and cpufreq.c; this is the same dangling declaration and
+	#     call in a third file, and modpost found it only because the other two
+	#     were already gone:
+	#         ERROR: modpost: "task_is_booster" [drivers/block/zram/zram.ko]
+	#                 undefined!
+	#     zram_drv.c:274 declares it locally and line 2587 calls it in
+	#     compressor_store:
+	#         if (task_is_booster(current))
+	#             return len;
+	#     A grep for "booster" across the tree finds only input_booster*.c and a
+	#     regulator, so as in #22 and #27 the definition is in a MediaTek module
+	#     this tree does not carry. The call only refuses a compressor change for
+	#     boosting processes; removing it means such a write is accepted instead.
+	#     Same shape as the other two, and the same escape hatch: if a definition
+	#     ever appears, the pattern stops matching and this leaves the file alone.
+	local zram_c="${KERNEL_DIR}/drivers/block/zram/zram_drv.c"
+	if [ -f "$zram_c" ] && grep -q '^bool task_is_booster(struct task_struct \*tsk);$' "$zram_c"; then
+		sed -i '/^bool task_is_booster(struct task_struct \*tsk);$/d' "$zram_c"
+		sed -i '/^\tif (task_is_booster(current))$/,+1d' "$zram_c"
+		if grep -q 'task_is_booster' "$zram_c"; then
+			warn "ZRAM: task_is_booster still referenced after removal"
+		else
+			info "ZRAM: removed the call to task_is_booster (no definition exists in this tree)"
+		fi
+	elif [ -f "$zram_c" ] && grep -q 'task_is_booster' "$zram_c"; then
+		warn "ZRAM: task_is_booster present but the pattern did not match; leaving it alone"
+	fi
+
+	# 29. GPufreq v2: every per-SoC object set is built, and MT6895's is broken
+	#     upstream. drivers/gpu/mediatek/gpufreq/v2/Makefile lists
+	#         mtk_gpufreq_mt6789-y := ... gpudfd_mt6789.o
+	#         mtk_gpufreq_mt6833-y := ... gpudfd_mt6833.o
+	#         mtk_gpufreq_mt6855-y := ... gpudfd_mt6855.o
+	#         mtk_gpufreq_mt6879-y := ... gpudfd_mt6879.o
+	#         mtk_gpufreq_mt6893-y := ... gpudfd_mt6893.o
+	#         mtk_gpufreq_mt6895-y := ... gpufreq_mt6895.o    <- no gpudfd
+	#         mtk_gpufreq_mt6983-y := ... gpudfd_mt6983.o
+	#     and gpufreq_mt6895.c calls gpudfd_init, which nothing in the tree
+	#     defines once gpudfd_mt6895.o is missing from its list. The obj- line is
+	#     still guarded on gpudfd_mt6895.c existing, so the wildcard test passes
+	#     and the module is built without the object it needs:
+	#         ERROR: modpost: "gpudfd_init"
+	#                 [drivers/gpu/mediatek/gpufreq/v2/mtk_gpufreq_mt6895.ko]
+	#                 undefined!
+	#     This is the same class of vendor slip as the show_stack arity in
+	#     drivers/misc/mediatek/connectivity, and the fix is not ours to guess:
+	#     adding gpudfd_mt6895.o would mean shipping an MT6895 GPU driver.
+	#     GTA9 is MT6789, so drop the other six the way patches 1, 3 and 4 already
+	#     do for camera pda, cmdq and mdp. None of them is referenced by built-in
+	#     code; they were separate .ko files before and are simply not built now.
+	local gpufreq_mk="${KERNEL_DIR}/drivers/gpu/mediatek/gpufreq/v2/Makefile"
+	if [ -f "$gpufreq_mk" ] && grep -q 'mtk_gpufreq_mt6895\.o' "$gpufreq_mk"; then
+		sed -i -E '/obj-\$\(CONFIG_MTK_GPU_MT[0-9]+_SUPPORT\) \+= mtk_gpufreq_mt[0-9]+\.o$/ {/mt6789/!d}' "$gpufreq_mk"
+		local kept dropped
+		kept=$(grep -c 'obj-\$(CONFIG_MTK_GPU_MT[0-9]*_SUPPORT) += mtk_gpufreq_mt' "$gpufreq_mk" || true)
+		dropped=$(grep -c 'mtk_gpufreq_mt6895' "$gpufreq_mk" || true)
+		if [ "$kept" -eq 1 ] && [ "$dropped" -eq 0 ]; then
+			info "GPUFREQ: kept only mtk_gpufreq_mt6789.o (GTA9=MT6789; MT6895 lacks gpudfd_*)"
+		else
+			warn "GPUFREQ: expected 1 kept and 0 mt6895 lines, got kept=$kept mt6895=$dropped"
+		fi
 	fi
 
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
