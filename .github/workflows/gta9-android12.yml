@@ -1,0 +1,192 @@
+name: gta9 Android 12
+
+# A separate workflow from Build Kernel on purpose. The runs in that one
+# accumulate error after error and the log of the latest is not readable next
+# to them; this one is a fresh list where the run that matters is the one on
+# top.
+#
+# It reuses the same scripts and the same Odin boot image step. The only thing
+# that differs is the profile: config/gta9_android12.env, which is a modular
+# build off the device's own kernel configuration. See that file for why.
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Config file to build"
+        required: false
+        default: "config/gta9_android12.env"
+        type: string
+      publish_release:
+        description: "Publish as a GitHub Release"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: gta9-android12-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: gta9 (Android 12, 5.10.205)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      WORKSPACE: ${{ github.workspace }}/kernel_workspace
+      CONFIG_ENV: ${{ inputs.config }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve configuration
+        run: bash scripts/config.sh
+
+      # Written down before the build, so a run that dies at minute 40 still
+      # says what it was building. The previous runs left this to be inferred
+      # from a diff after the fact.
+      - name: Record the profile
+        run: |
+          {
+            echo "config    = ${CONFIG_ENV}"
+            echo "source    = ${KERNEL_SOURCE}"
+            echo "branch    = ${KERNEL_SOURCE_BRANCH}"
+            echo "defconfig = ${KERNEL_CONFIG}"
+            echo "variant   = ${KSU_VARIANT}"
+            echo "modules   = $([ "${CONFIG_MODULES:-n}" = n ] && echo off || echo on)"
+            echo "defconfig options = $(tr ' ' '\n' <<< "${EXTRA_DEFCONFIG}" | grep -c '=n$') pinned to n"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Free up disk space
+        if: env.REMOVE_UNUSED_PACKAGES == 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex \
+            git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd \
+            libncurses-dev
+          mkdir -p "$WORKSPACE"
+
+      - name: Set up toolchain
+        run: bash scripts/toolchain.sh
+
+      - name: Fetch kernel source
+        run: bash scripts/source.sh
+
+      - name: Install KernelSU
+        if: env.KSU_VARIANT != 'none'
+        run: bash scripts/kernelsu.sh
+
+      - name: Apply kernel patches
+        run: bash scripts/patches.sh all
+
+      - name: Set up ccache
+        if: env.ENABLE_CCACHE == 'true'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: gta9-android12-${{ env.KERNEL_VERSION }}
+          max-size: 2G
+
+      # -k on purpose: the Makefile is given keep-going so that every error in
+      # the tree is reported at once. Without it the first failure hides the
+      # rest, which is how the earlier rounds ended up fixing one file per
+      # run.
+      - name: Build kernel
+        run: bash scripts/build.sh all
+
+      # The two things that actually decide whether this profile is viable,
+      # printed on their own. A build that stops at ld.lld is either a finite
+      # list of undefined symbols or an unbounded pile of duplicates, and the
+      # difference is the whole difference between the two approaches.
+      - name: Report the link result
+        if: always()
+        run: |
+          log="${RUNNER_TEMP}/build.log"
+          echo "### Link result" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          undef=$(grep -oE 'undefined symbol: \S+' "$log" 2>/dev/null | awk '{print $3}' | sort -u | wc -l)
+          dup=$(grep -oE 'duplicate symbol: \S+' "$log" 2>/dev/null | awk '{print $3}' | sort -u | wc -l)
+          cerr=$(grep -cE '(fatal )?error:' "$log" 2>/dev/null || echo 0)
+          {
+            echo "| | count |"
+            echo "| --- | --- |"
+            echo "| compile errors | ${cerr} |"
+            echo "| undefined symbols | ${undef} |"
+            echo "| duplicate symbols | ${dup} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$log" ]; then
+            {
+              echo
+              echo "<details><summary>undefined symbols</summary>"
+              echo
+              grep -oE 'undefined symbol: \S+' "$log" | awk '{print $3}' | sort -u | sed 's/^/- /'
+              echo
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "compile=$cerr undefined=$undef duplicate=$dup"
+
+      - name: Upload resolved kernel config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta9-config-${{ env.BUILD_TIME }}
+          path: kernel_workspace/android-kernel/out/.config
+          include-hidden-files: true
+          if-no-files-found: warn
+
+      - name: Package artifacts
+        run: bash scripts/package.sh all
+
+      - name: Build Odin boot image
+        if: env.BUILD_ODIN_BOOT_IMG == 'true'
+        run: bash scripts/odinboot.sh
+
+      - name: Upload kernel image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/android-kernel/out/arch/${{ env.ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }}
+          if-no-files-found: error
+
+      - name: Upload AnyKernel3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/AnyKernel3/*
+          if-no-files-found: error
+
+      - name: Upload Odin boot image
+        if: always() && env.ODIN_BOOT_IMAGE_IS_OK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+          path: kernel_workspace/new-boot.img
+          if-no-files-found: error
