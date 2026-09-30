@@ -190,6 +190,28 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
+      # Module.symvers carries one line per exported symbol and, when
+      # CONFIG_MODVERSIONS is on, the CRC of the type behind it. That CRC is
+      # what insmod checks in a module's own __versions section, and it is the
+      # only remaining explanation for a kernel that links clean, matches the
+      # device's config in every one of its 2,721 options, and still dies before
+      # userspace with no panic and no log: if any CRC differs, every module the
+      # tablet loads is refused and init cannot mount anything.
+      #
+      # The firmware on the tablet carries 202 stock modules with real Samsung
+      # CRCs in RECOVERY/RAMDISK/lib/modules, so this file is enough to prove or
+      # rule that out in one comparison, with no further guessing.
+      - name: Upload Module.symvers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta9-symvers-${{ env.BUILD_TIME }}
+          path: |
+            kernel_workspace/android-kernel/out/Module.symvers
+            kernel_workspace/android-kernel/out/*.symvers
+          include-hidden-files: true
+          if-no-files-found: warn
+
       - name: Package artifacts
         run: bash scripts/package.sh all
 
