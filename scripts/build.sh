@@ -174,6 +174,43 @@ prepare_defconfig() {
 	# It is a bisect, not a fix. If this build boots, one of the patches is at
 	# fault and they go back one at a time. If it does not, the problem is the
 	# source or the toolchain, and the patches were never the issue.
+	# PATCH_WHITELIST selects which of the numbered edits below run. Empty means
+	# all of them, which is every profile's existing behaviour, so nothing changes
+	# unless a profile asks for a subset.
+	#
+	# It exists to bisect. Twenty-five of these were written while the build was
+	# monolithic, and the run that finally linked clean still produced a kernel
+	# that died before userspace, with no panic, no pstore record and no adbd --
+	# so nothing on the device could say where it stopped. The edits divide
+	# cleanly in two: 1, 3, 4 and 29 only delete per-SoC objects from Makefiles,
+	# while the other twenty-one rewrite .c files. A kernel that fails to link
+	# because two symbols collide is a linker complaint. A kernel that boots and
+	# then dies silently is usually a rewritten source file, so the .c edits are
+	# the more likely cause and are the ones to hold back first.
+	patch_enabled() {
+		[ -n "${PATCH_WHITELIST:-}" ] || return 0
+		# Accept commas, spaces or tabs. A profile that writes
+		# PATCH_WHITELIST=1 3 4 29 gets the same answer as one that writes
+		# PATCH_WHITELIST=1,3,4,29, and every other list in this repo is
+		# space separated -- EXTRA_DEFCONFIG has to be, because kbuild splits
+		# it on whitespace. Matching on commas only made the space form
+		# silently mean "run everything".
+		local list
+		list=",$(printf '%s' "${PATCH_WHITELIST}" | tr ',\t' '  ' | tr -s ' ' ','),"
+		case "$list" in
+		*,"$1",*) return 0 ;;
+		esac
+		return 1
+	}
+
+	if [ -n "${PATCH_WHITELIST:-}" ]; then
+		local pe
+		pe=$(printf '%s' "$PATCH_WHITELIST" | tr ' ' '\n' | grep -cE '^[0-9]+$' | head -1)
+		info "PATCH_WHITELIST = ${PATCH_WHITELIST} (${pe:-0} patch(es); the rest are skipped)"
+	else
+		info "PATCH_WHITELIST is empty: all 29 patches will run"
+	fi
+
 	if is_true "${NO_TREE_PATCHES:-false}"; then
 		warn "NO_TREE_PATCHES is set: building the vendor tree unpatched."
 		warn "The device's own config is used as-is, so any duplicate symbol or"
@@ -201,6 +238,7 @@ prepare_defconfig() {
 	#    (isp_71 other SoCs) and pda_drv_mt6855 (which pulls in
 	#    isp_6s/camera_pda.o — a DIFFERENT .c with the same name and same
 	#    globals). All collide under lld. Keep only the MT6789 generic object.
+	if patch_enabled 1; then
 	local pda_mk="${KERNEL_DIR}/drivers/misc/mediatek/cameraisp/pda/Makefile"
 	if [ -f "$pda_mk" ]; then
 		sed -i -E '/obj-\$\(CONFIG_MTK_CAMERA_ISP_PDA_SUPPORT\) \+= pda_drv_mt(6879|6895|6855)\.o/d' "$pda_mk"
@@ -208,9 +246,11 @@ prepare_defconfig() {
 		info "PDA: dropped non-MT6789 platform objects (GTA9=MT6789)"
 	fi
 
+	fi
 	# 2. GPU DCS: g_core_mask_table is a file-global in ged_dcs.c (also used by
 	#    the gpufreq getter in gpufreq_mt6789.c). Keep ged's copy but rename it
 	#    so the two built-in objects no longer collide.
+	if patch_enabled 2; then
 	local ged_dcs="${KERNEL_DIR}/drivers/gpu/mediatek/ged/src/ged_dcs.c"
 	if [ -f "$ged_dcs" ] && grep -q "struct gpufreq_core_mask_info \*g_core_mask_table;" "$ged_dcs"; then
 		sed -i 's/struct gpufreq_core_mask_info \*g_core_mask_table;/struct gpufreq_core_mask_info *g_core_mask_table_dcs;/' "$ged_dcs"
@@ -218,18 +258,22 @@ prepare_defconfig() {
 		info "GPU DCS: renamed g_core_mask_table -> g_core_mask_table_dcs"
 	fi
 
+	fi
 	# 3. CMDQ mailbox: wildcard-gates every cmdq-platform-mtNNNN.o; two of
 	#    them (e.g. mt6833 vs mt6893) collide on exported symbols. Keep only
 	#    the MT6789 one for GTA9.
+	if patch_enabled 3; then
 	local cmdq_mk="${KERNEL_DIR}/drivers/misc/mediatek/cmdq/mailbox/Makefile"
 	if [ -f "$cmdq_mk" ]; then
 		sed -i -E '/obj-\$\(CONFIG_MTK_CMDQ_MBOX_EXT\) \+= cmdq-platform-mt[0-9]+\.o$/ {/cmdq-platform-mt6789\.o$/!d}' "$cmdq_mk"
 		info "CMDQ: kept only cmdq-platform-mt6789.o (GTA9=MT6789)"
 	fi
 
+	fi
 	# 4. MDP (MediaTek DataPath): same wildcard pattern — mdp_drv_mt6893.o
 	#    plus mdp_drv_mt6879.o collide on cmdq_mdp_* symbols (run #54). Keep
 	#    only the MT6789 one for GTA9.
+	if patch_enabled 4; then
 	local mdp_mk="${KERNEL_DIR}/drivers/misc/mediatek/mdp/Makefile"
 	if [ -f "$mdp_mk" ]; then
 		sed -i -E '/obj-\$\(CONFIG_MTK_MDP\) \+= mdp_drv_mt[0-9]+\.o$/ {/mdp_drv_mt6789\.o$/!d}' "$mdp_mk"
@@ -237,6 +281,7 @@ prepare_defconfig() {
 		info "MDP: kept only mdp_drv_mt6789.o (GTA9=MT6789)"
 	fi
 
+	fi
 	# 5. IMGSENSOR frame-sync (run #55/#56; REVISED in #77). The legacy src/ tree
 	#    builds its own frame_monitor.o + frame_sync_algo.o via
 	#    src/common/v1_1/n3d_fsync/frame-sync/frame_sync_drv.mk, and
@@ -272,6 +317,7 @@ prepare_defconfig() {
 	#    calls it, so run #108's modpost reported
 	#        ERROR: modpost: "FrameSyncInit" [imgsensor_isp6s.ko] undefined!
 	#    So keep the objects when modules are on -- see modules_on() above.
+	if patch_enabled 5; then
 	local n3d_fsync_mk="${KERNEL_DIR}/drivers/misc/mediatek/imgsensor/src/common/v1_1/n3d_fsync/frame-sync/frame_sync_drv.mk"
 	if modules_on; then
 		info "IMGSENSOR: skipped, frame-sync objects stay (the v4l2 copy is a separate module)"
@@ -280,14 +326,17 @@ prepare_defconfig() {
 		info "IMGSENSOR: dropped the duplicated frame-sync objects, kept n3d.o"
 	fi
 
+	fi
 	# 6. MDP MT6789: its file-global 'struct device *larb2' collides with the
 	#    same symbol in camera_pda.o (run #55/#56). It is only used inside
 	#    mdp_mt6789.c, so rename it (like g_core_mask_table_dcs).
+	if patch_enabled 6; then
 	local mdp6789="${KERNEL_DIR}/drivers/misc/mediatek/mdp/mdp_mt6789.c"
 	if [ -f "$mdp6789" ] && grep -q "struct device \*larb2;" "$mdp6789"; then
 		sed -i 's/struct device \*larb2;/struct device *larb2_mdp;/' "$mdp6789"
 		sed -i 's/\blarb2\b/larb2_mdp/g' "$mdp6789"
 		info "MDP6789: renamed larb2 -> larb2_mdp"
+	fi
 	fi
 	# 7. Lens VCM driver (run #57): DW9763AF.c defines 'u8 read_data(u8 addr)'
 	#    which collides with cam_cal's read_data(). DW9763AF.h does NOT declare
@@ -295,6 +344,7 @@ prepare_defconfig() {
 	#    duplicate (still global in LD even after the sed ran, seen in run
 	#    #57/#59), so rename it to a file-unique symbol instead (same pattern
 	#    as g_core_mask_table_dcs / larb2_mdp).
+	if patch_enabled 7; then
 	local dw9763af="${KERNEL_DIR}/drivers/misc/mediatek/lens/vcm/proprietary/main/common/dw9763af/DW9763AF.c"
 	if [ -f "$dw9763af" ] && grep -q "u8 read_data(u8 addr)" "$dw9763af"; then
 		sed -i 's/u8 read_data(u8 addr)/static u8 dw9763af_read_data(u8 addr)/' "$dw9763af"
@@ -302,6 +352,7 @@ prepare_defconfig() {
 		info "DW9763AF: renamed read_data -> dw9763af_read_data (static)"
 	fi
 
+	fi
 	# 8. Thermal/power (run #57): mtk_pbm.c and mtk_cm_mgr_common.c both define
 	#    a global 'void tracepoint_cleanup(void)' -> duplicate symbol under lld.
 	#    Only the PBM copy is made static. cm_mgr is a cross-subsystem power
@@ -310,12 +361,14 @@ prepare_defconfig() {
 	#    the collision; the definition is at line 677 of mtk_pbm.c and its only
 	#    call is in the same file (line 947), so the regex below (anchored at
 	#    line start) never touches the call.
+	if patch_enabled 8; then
 	local pbm_c="${KERNEL_DIR}/drivers/misc/mediatek/pbm/mtk_pbm.c"
 	if [ -f "$pbm_c" ] && grep -q "void tracepoint_cleanup(void)" "$pbm_c"; then
 		sed -i 's/^void tracepoint_cleanup(void)/static void tracepoint_cleanup(void)/' "$pbm_c"
 		info "PBM: made tracepoint_cleanup static (cm_mgr copy left untouched)"
 	fi
 
+	fi
 	# 9. IOMMU debug (run #61/#62): iommu_debug.c (CONFIG_MTK_IOMMU_MISC_DBG)
 	#    registers android vendor-hook tracepoints
 	#    (register_trace_android_vh_iommu_iovad_alloc/free_iova) that are NOT
@@ -326,6 +379,7 @@ prepare_defconfig() {
 	#    mtk_iova_dbg_*), so bypassing registration is safe and keeps the
 	#    IOMMU subsystem intact. Idempotent: replaces the two-line call with
 	#    a plain `ret = 0;` so the symbol reference disappears entirely.
+	if patch_enabled 9; then
 	local iommu_dbg="${KERNEL_DIR}/drivers/misc/mediatek/iommu/iommu_debug.c"
 	if [ -f "$iommu_dbg" ] && grep -q "register_trace_android_vh_iommu_iovad_alloc_iova" "$iommu_dbg"; then
 		sed -i '/ret = register_trace_android_vh_iommu_iovad_alloc_iova(alloc_iova_hook,/,/"mtk_m4u_dbg_probe");/c	ret = 0; /* vendor-hook bypass (not generated on 5.10 GTA9) */' "$iommu_dbg"
@@ -333,6 +387,7 @@ prepare_defconfig() {
 		info "IOMMU_DBG: bypassed android_vh_iommu_iovad_* vendor-hook registration"
 	fi
 
+	fi
 	# 10. Duplicate 'dev' (run #63): ccu_drv.c (ccu/isp6s) and
 	#     mtk-mmdvfs-debug.c (mmdvfs) both declare a file-global
 	#     'struct device *dev;' (mmdvfs-debug also 'struct regulator *reg;')
@@ -342,6 +397,7 @@ prepare_defconfig() {
 	#     mmdvfs-debug.h header, which only declares the exported function).
 	#     Make each global 'static' so the collision disappears (same pattern
 	#     as tracepoint_cleanup in run #57). Idempotent.
+	if patch_enabled 10; then
 	local ccu_drv="${KERNEL_DIR}/drivers/misc/mediatek/ccu/src/isp6s/ccu_drv.c"
 	if [ -f "$ccu_drv" ] && grep -q "^struct device \*dev;$" "$ccu_drv"; then
 		sed -i 's/^struct device \*dev;/static struct device *dev;/' "$ccu_drv"
@@ -354,6 +410,7 @@ prepare_defconfig() {
 		info "MMDVFS_DEBUG: made dev and reg static (dup symbol vs ccu_drv)"
 	fi
 
+	fi
 	# 11. SCP rv/ must be linkable into vmlinux (run #60 -> #64). This is a trap:
 	#     there is NO config value that works.
 	#     drivers/misc/mediatek/scp/Makefile is only 'obj-y += rv/' with no config
@@ -369,12 +426,14 @@ prepare_defconfig() {
 	#     Dropping -fno-pic -mcmodel=large makes the objects position independent,
 	#     so lld can relax the relocations and they link into vmlinux normally.
 	#     arm64 is PIC by default, so this is a no-op for codegen quality.
+	if patch_enabled 11; then
 	local scp_rv_mk="${KERNEL_DIR}/drivers/misc/mediatek/scp/rv/Makefile"
 	if [ -f "$scp_rv_mk" ] && grep -q -- '-fno-pic -mcmodel=large' "$scp_rv_mk"; then
 		sed -i 's/ -fno-pic -mcmodel=large//' "$scp_rv_mk"
 		info "SCP_RV: dropped -fno-pic -mcmodel=large so rv/ links into vmlinux"
 	fi
 
+	fi
 	# 12. dma-buf heap duplicate (run #65): drivers/dma-buf/heaps/mtk_heap_priv.h
 	#     *defines* dmabuf_release_check() in the header body with external
 	#     linkage. Every .c that includes it -- mtk_sec_heap.c,
@@ -386,12 +445,14 @@ prepare_defconfig() {
 	#     includer a private inline copy is behaviour-identical and removes the
 	#     collision. 'inline' also avoids -Wunused-function in the translation
 	#     units that include the header but never call it.
+	if patch_enabled 12; then
 	local mtk_priv_h="${KERNEL_DIR}/drivers/dma-buf/heaps/mtk_heap_priv.h"
 	if [ -f "$mtk_priv_h" ] && grep -q '^void dmabuf_release_check(' "$mtk_priv_h"; then
 		sed -i 's/^void dmabuf_release_check(/static inline void dmabuf_release_check(/' "$mtk_priv_h"
 		info "DMABUF_HEAP: made header-defined dmabuf_release_check static inline (dup symbol)"
 	fi
 
+	fi
 	# 13. monitor_hang_regist_ldt (run #66). mt-plat/aee.h is included by ~18
 	#     objects and switches on this symbol:
 	#         #if IS_ENABLED(CONFIG_MTK_HANG_DETECT)
@@ -413,6 +474,7 @@ prepare_defconfig() {
 	#     intent.
 	#     Anchored on a single leading tab: the already-guarded call at line 562
 	#     is indented with two tabs and must not be matched.
+	if patch_enabled 13; then
 	local hang_c="${KERNEL_DIR}/drivers/misc/mediatek/monitor_hang/hang_detect.c"
 	if [ -f "$hang_c" ] && ! grep -q 'mrdump-regist-guard' "$hang_c" &&
 		grep -q "^$(printf '\t')mrdump_regist_hang_bt(" "$hang_c"; then
@@ -426,6 +488,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 14. register_mrdump_reset_delay (run #68). Provider is
 	#     drivers/misc/mediatek/aee/mrdump/mrdump_panic.c, gated by
 	#     CONFIG_MTK_AEE_IPANIC which 'depends on MTK_AEE_FEATURE' -- and we pin
@@ -443,6 +506,7 @@ prepare_defconfig() {
 	#     quoting (a '|' delimiter collides with alternation, '#' collides with
 	#     the literal "#endif" in the replacement, and \1 vs $1 backreference
 	#     handling silently ate the indentation).
+	if patch_enabled 14; then
 	local sec_reset_h="${KERNEL_DIR}/drivers/samsung/sec_hard_reset_hook.c"
 	if [ -f "$sec_reset_h" ] && ! grep -q 'sec-mrdump-guard' "$sec_reset_h" &&
 		grep -q "^$(printf '\t')register_mrdump_reset_delay(" "$sec_reset_h"; then
@@ -498,6 +562,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 15. ged tracepoint collides with an upstream event (run #72; CORRECTED in #80).
 	#     drivers/gpu/mediatek/ged/include/ged_tracepoint.h declares
 	#         TRACE_EVENT(tracing_mark_write, ...)
@@ -528,6 +593,7 @@ prepare_defconfig() {
 	#     event is NOT a Kconfig problem: CONFIG_EVENT_TRACING=y already builds
 	#     the provider, so there is nothing to configure. Both halves are needed
 	#     and both are done here.
+	if patch_enabled 15; then
 	local ged_tp="${KERNEL_DIR}/drivers/gpu/mediatek/ged/include/ged_tracepoint.h"
 	if [ -f "$ged_tp" ] && grep -q '^TRACE_EVENT(tracing_mark_write,$' "$ged_tp"; then
 		sed -i 's/^TRACE_EVENT(tracing_mark_write,$/TRACE_EVENT(ged_tracing_mark_write,/' "$ged_tp"
@@ -556,6 +622,7 @@ prepare_defconfig() {
 		info "GED_TRACEPOINT: no ged call sites needed rewriting"
 	fi
 
+	fi
 	# 16. mtk_pm_qos_update_request declared in two regulator drivers (run #73).
 	#     drivers/regulator/mtk-vmm-trace.h lines 15-44 are a byte-identical
 	#     copy-paste of mtk-dvfsrc-regulator-trace.h: the same
@@ -597,6 +664,7 @@ prepare_defconfig() {
 	#       b) define_trace.h:99 redefines DECLARE_TRACE to a no-op, so a
 	#          DECLARE_TRACE placed after the vmm include may be silently dropped.
 	#     Both are dumped below so the next run settles it with evidence.
+	if patch_enabled 16; then
 	local vmm_tp="${KERNEL_DIR}/drivers/regulator/mtk-vmm-trace.h"
 	if [ -f "$vmm_tp" ] && grep -q '^DECLARE_EVENT_CLASS(mtk_pm_qos_request,$' "$vmm_tp"; then
 		# CORRECTED in #80. This used to delete the pasted block outright:
@@ -684,6 +752,7 @@ prepare_defconfig() {
 	fi
 
 
+	fi
 	# 17. SCP 3-way semaphore notifier (run #77). scp_helper.c calls
 	#     register_3way_semaphore_notifier() / unregister_3way_semaphore_notifier()
 	#     from mtk-afe-external.h, but the only definition sits in
@@ -705,6 +774,7 @@ prepare_defconfig() {
 	#     mtk-afe-external.o becomes a .ko that resolves those two symbols itself,
 	#     and the three obj-y lines below would drag sound/soc/mediatek/common
 	#     into vmlinux for no reason.
+	if patch_enabled 17; then
 	local snd_mk="${KERNEL_DIR}/sound/Makefile"
 	local soc_mk="${KERNEL_DIR}/sound/soc/Makefile"
 	local mtk_soc_mk="${KERNEL_DIR}/sound/soc/mediatek/Makefile"
@@ -722,6 +792,7 @@ prepare_defconfig() {
 		info "AFE: built mtk-afe-external.o into vmlinux (was obj-m, dead with MODULES=n)"
 	fi
 
+	fi
 	# 19. gpueb is hung off obj-m (run #79). drivers/gpu/mediatek/gpueb/Makefile:
 	#         obj-m += gpueb.o
 	#     CONFIG_MODULES is n in this tree, so scripts/Makefile.build discards
@@ -750,6 +821,7 @@ prepare_defconfig() {
 	#     to this one sed. With modules on none of it applies: gpueb.ko exports
 	#     those names and modpost resolves them the way it resolves every other
 	#     module's. CONFIG_MTK_GPU_SUPPORT stays =m either way.
+	if patch_enabled 19; then
 	local gpueb_mk="${KERNEL_DIR}/drivers/gpu/mediatek/gpueb/Makefile"
 	if modules_on; then
 		info "GPUEB: skipped, gpueb.o stays obj-m (modules are on)"
@@ -762,6 +834,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 20. Secure CMDQ is gated on a make-level `ifeq ...,m` (run #79).
 	#     drivers/misc/mediatek/cmdq/mailbox/Makefile guards the three objects
 	#     that provide every cmdq_sec_* symbol with:
@@ -786,6 +859,7 @@ prepare_defconfig() {
 	#
 	#     The rewrite is only correct in a y/n world. With CONFIG_MODULES=y the
 	#     author gets what they wrote, so leave the line alone there.
+	if patch_enabled 20; then
 	local cmdq_mk="${KERNEL_DIR}/drivers/misc/mediatek/cmdq/mailbox/Makefile"
 	if modules_on; then
 		info "CMDQ: skipped, the 'ifeq ...,m' guard is already correct (modules are on)"
@@ -798,6 +872,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 21. Three file-global collisions, both sides newly built (run #80).
 	#     With the 19 run-#80 symbols gone the link was clean of undefined
 	#     references for the first time, and this is what was underneath:
@@ -825,6 +900,7 @@ prepare_defconfig() {
 	#     *type* called cmdq_sec_helper_fp, and '_' is a word character, so
 	#     \bhelper_fp\b cannot match inside it. A plain s/helper_fp/.../ would
 	#     have renamed the struct as well and broken the file.
+	if patch_enabled 21; then
 	local gl_c="${KERNEL_DIR}/drivers/gpu/mediatek/gpueb/gpueb_logger.c"
 	if [ -f "$gl_c" ] && grep -q '\br_pos_debug\b' "$gl_c"; then
 		sed -i 's/\br_pos_debug\b/gpueb_r_pos_debug/g; s/\blog_ctl_debug\b/gpueb_log_ctl_debug/g' "$gl_c"
@@ -844,6 +920,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 22. task_is_booster has no definition anywhere in this tree (run #81).
 	#     block/elevator.c:767 forward-declares it and :774 calls it:
 	#         bool task_is_booster(struct task_struct *tsk);
@@ -879,6 +956,7 @@ prepare_defconfig() {
 	#     Both the declaration and the call are removed together, and the
 	#     verification checks that neither the declaration nor the symbol name
 	#     survives, so a tree that *does* define it would be left alone.
+	if patch_enabled 22; then
 	local elev_c="${KERNEL_DIR}/block/elevator.c"
 	if [ -f "$elev_c" ] && grep -q '^bool task_is_booster(struct task_struct \*tsk);$' "$elev_c"; then
 		sed -i '/^bool task_is_booster(struct task_struct \*tsk);$/d' "$elev_c"
@@ -892,6 +970,7 @@ prepare_defconfig() {
 		warn "ELEVATOR: task_is_booster present but the pattern did not match; leaving it alone"
 	fi
 
+	fi
 	# 23. mtk_drm_fbdev.c does not compile against its own struct (run #82).
 	#     Turning on DRM worked: run #82 got past the whole display stack and
 	#     failed on 4 compile errors, all in this one file, all of one kind:
@@ -923,6 +1002,7 @@ prepare_defconfig() {
 	#     The .config line is dropped from EXTRA_DEFCONFIG in the same commit, so
 	#     this patch only has to make the Makefile agree. Both halves are needed:
 	#     a build.sh edit alone would leave a =y that pulls the object back in.
+	if patch_enabled 23; then
 	local drm_mk="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mediatek_v2/Makefile"
 	if [ -f "$drm_mk" ] && grep -q 'mediatek-drm-\$(CONFIG_DRM_FBDEV_EMULATION) += mtk_drm_fbdev\.o' "$drm_mk"; then
 		sed -i 's#^mediatek-drm-\$(CONFIG_DRM_FBDEV_EMULATION) += mtk_drm_fbdev\.o$##' "$drm_mk"
@@ -933,6 +1013,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 24. mediatek_v2 imposes its own -Werror, which outranks KCFLAGS (run #83).
 	#     include/soc/mediatek/mmqos.h:61 trips it:
 	#         mtk_mmqos_hrt_scen(enum hrt_scen, bool is_start) { return 0; }
@@ -954,6 +1035,7 @@ prepare_defconfig() {
 	#     Checked first: of the Makefiles under drivers/gpu/drm/mediatek/ only
 	#     this one carries -Werror, so this is the whole of it and not the first
 	#     of many.
+	if patch_enabled 24; then
 	local drmv2_mk="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mediatek_v2/Makefile"
 	if [ -f "$drmv2_mk" ] && grep -q '^subdir-ccflags-y += -Werror$' "$drmv2_mk"; then
 		sed -i 's/^subdir-ccflags-y += -Werror$/subdir-ccflags-y += -Wno-error/' "$drmv2_mk"
@@ -964,6 +1046,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 25. mtk_dramc.h is not in this tree (run #83).
 	#     mtk_layering_rule.c:19-21:
 	#         #if defined(CONFIG_MTK_DRAMC)
@@ -987,6 +1070,7 @@ prepare_defconfig() {
 	#     costs no behaviour. Pinning CONFIG_MTK_DRAMC=n would also have
 	#     compiled, but it would throw away the DRAM calibration driver that does
 	#     build, in order to work around an include that references nothing.
+	if patch_enabled 25; then
 	local layer_c="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mediatek_v2/mtk_layering_rule.c"
 	if [ -f "$layer_c" ] && grep -q '^#include "mtk_dramc\.h"$' "$layer_c"; then
 		local layer_before
@@ -999,6 +1083,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 26. Four MML tile-processor variants all build at once (run #84).
 	#     Run #84 compiled the whole tree cleanly for the first time -- 0 compile
 	#     errors, 0 undefined symbols, and the link was reached. The only thing
@@ -1038,6 +1123,7 @@ prepare_defconfig() {
 	#     outcome: this tree ships no MML tile-processor implementation for
 	#     MT6789. mediatek_v2 does have a chip-specific file for it,
 	#     platform/mtk_drm_6789.o, and that one is still built.
+	if patch_enabled 26; then
 	local mml_mk="${KERNEL_DIR}/drivers/gpu/drm/mediatek/mml/Makefile"
 	if [ -f "$mml_mk" ]; then
 		local tp_soc
@@ -1053,6 +1139,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 27. task_is_booster, second call site (run #86).
 	#     Run #85 fixed the one in block/elevator.c. Turning CPU_FREQ on in run
 	#     #86 built drivers/cpufreq/cpufreq.o for the first time, and it has the
@@ -1075,6 +1162,7 @@ prepare_defconfig() {
 	#     The code is written so a tree that does define it is left alone: both
 	#     the declaration and the call are matched together, and if a definition
 	#     ever appears this patch is what should be dropped.
+	if patch_enabled 27; then
 	local cpufreq_c="${KERNEL_DIR}/drivers/cpufreq/cpufreq.c"
 	if [ -f "$cpufreq_c" ] && grep -q '^bool task_is_booster(struct task_struct \*tsk);$' "$cpufreq_c"; then
 		sed -i '/^bool task_is_booster(struct task_struct \*tsk);$/d' "$cpufreq_c"
@@ -1088,6 +1176,7 @@ prepare_defconfig() {
 		warn "CPUFREQ: task_is_booster present but the pattern did not match; leaving it alone"
 	fi
 
+	fi
 	# 28. task_is_booster, third call site (run #108). Patches 22 and 27 cleared
 	#     elevator.c and cpufreq.c; this is the same dangling declaration and
 	#     call in a third file, and modpost found it only because the other two
@@ -1104,6 +1193,7 @@ prepare_defconfig() {
 	#     boosting processes; removing it means such a write is accepted instead.
 	#     Same shape as the other two, and the same escape hatch: if a definition
 	#     ever appears, the pattern stops matching and this leaves the file alone.
+	if patch_enabled 28; then
 	local zram_c="${KERNEL_DIR}/drivers/block/zram/zram_drv.c"
 	if [ -f "$zram_c" ] && grep -q '^bool task_is_booster(struct task_struct \*tsk);$' "$zram_c"; then
 		sed -i '/^bool task_is_booster(struct task_struct \*tsk);$/d' "$zram_c"
@@ -1117,6 +1207,7 @@ prepare_defconfig() {
 		warn "ZRAM: task_is_booster present but the pattern did not match; leaving it alone"
 	fi
 
+	fi
 	# 29. GPufreq v2: every per-SoC object set is built, and MT6895's is broken
 	#     upstream. drivers/gpu/mediatek/gpufreq/v2/Makefile lists
 	#         mtk_gpufreq_mt6789-y := ... gpudfd_mt6789.o
@@ -1139,6 +1230,7 @@ prepare_defconfig() {
 	#     GTA9 is MT6789, so drop the other six the way patches 1, 3 and 4 already
 	#     do for camera pda, cmdq and mdp. None of them is referenced by built-in
 	#     code; they were separate .ko files before and are simply not built now.
+	if patch_enabled 29; then
 	local gpufreq_mk="${KERNEL_DIR}/drivers/gpu/mediatek/gpufreq/v2/Makefile"
 	if [ -f "$gpufreq_mk" ] && grep -q 'mtk_gpufreq_mt6895\.o' "$gpufreq_mk"; then
 		sed -i -E '/obj-\$\(CONFIG_MTK_GPU_MT[0-9]+_SUPPORT\) \+= mtk_gpufreq_mt[0-9]+\.o$/ {/mt6789/!d}' "$gpufreq_mk"
@@ -1152,6 +1244,7 @@ prepare_defconfig() {
 		fi
 	fi
 
+	fi
 	# 18. See every undefined symbol, not just the first 20 (run #78). lld stops
 	#     after 20 errors and says so:
 	#         ld.lld: error: too many errors emitted, stopping now
@@ -1166,6 +1259,7 @@ prepare_defconfig() {
 	#     ${LD} is invoked directly here, so the flag takes no -Wl, prefix.
 	#     CONFIG_LTO_CLANG is off in this build (CONFIG_LTO_NONE=y), which is
 	#     the branch this line is in; the other branch is the ${CC} one below it.
+	if patch_enabled 18; then
 	local link_sh="${KERNEL_DIR}/scripts/link-vmlinux.sh"
 	if [ -f "$link_sh" ] && grep -q 'error-limit' "$link_sh"; then
 		info "LINK: --error-limit=0 already present"
@@ -1194,7 +1288,21 @@ prepare_defconfig() {
 
 	is_true "${DISABLE_CC_WERROR:-false}" && kconf_disable "$DEFCONFIG_PATH" CONFIG_CC_WERROR
 
+	fi
+	fi   # end of NO_TREE_PATCHES -- tree edits only, deliberately not the config
+
 	# Free-form extras: one CONFIG_x=y per line, or space separated.
+	#
+	# Outside the guard on purpose. The first version of it closed after this loop
+	# and swallowed it: NO_TREE_PATCHES=true then built with the defconfig exactly
+	# as it came, CONFIG_TRIM_UNUSED_KSYMS stayed at the stock "y", and the build
+	# died in seven seconds on
+	#
+	#   ERROR: '/home/dpi/qb5_8814/workspace/P4_1716/android/out/target/product/
+	#          gta9wifi/obj/KERNEL_OBJ/kernel-5.10/abi_symbollist.raw'
+	#          whitelist file not found
+	#
+	# a Samsung-internal symbol whitelist that was never published.
 	if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
 		local kv
 		# shellcheck disable=SC2086
@@ -1206,8 +1314,6 @@ prepare_defconfig() {
 			esac
 		done
 	fi
-
-	fi   # end of NO_TREE_PATCHES -- every in-tree patch above is inside this
 
 	# A stable LOCALVERSION keeps artifact names predictable. Without this the
 	# tree appends "-dirty" as soon as any patch above touches a tracked file.
