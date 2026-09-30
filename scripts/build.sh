@@ -160,6 +160,35 @@ prepare_defconfig() {
 		info "MODULES: off -- patches 17/19/20 (obj-m workarounds) will apply"
 	fi
 
+	# NO_TREE_PATCHES builds the vendor tree exactly as it came, and skips every
+	# in-tree edit below. It exists because 25 of those edits were written for a
+	# monolithic build and are now unverified against a modular one: they were
+	# needed to remove duplicate symbols that only exist once CONFIG_MODULES=n
+	# folds 191 per-SoC objects into vmlinux, and this profile is modular. A
+	# duplicate symbol is harmless -- the link tells us which ones -- but a patch
+	# that deletes the only copy of a driver is not, and the kernel from run
+	# #113 died before userspace with no panic and therefore no log anywhere.
+	# The ramdisk was byte-identical to stock and the config matched the running
+	# kernel in all 2,721 options, so the tree itself is the last suspect.
+	#
+	# It is a bisect, not a fix. If this build boots, one of the patches is at
+	# fault and they go back one at a time. If it does not, the problem is the
+	# source or the toolchain, and the patches were never the issue.
+	if is_true "${NO_TREE_PATCHES:-false}"; then
+		warn "NO_TREE_PATCHES is set: building the vendor tree unpatched."
+		warn "The device's own config is used as-is, so any duplicate symbol or"
+		warn "undefined symbol reported below is a fact about the tree, not a"
+		warn "regression from anything in this script."
+		summary "| Tree patches | none (NO_TREE_PATCHES) |"
+		info "skipping all in-tree patches"
+	else
+
+	# ---------------------------------------------------------------- patches ---
+	# Every edit to the vendor tree happens inside this else, so that
+	# NO_TREE_PATCHES=true skips all of it without moving a single line out of
+	# place. What follows is the patch block, ending at the `fi` just before the
+	# LOCALVERSION section.
+
 	# Vendor trees routinely ship multi-platform .c files behind 'obj-y' even
 	# when the driver is '=m' (see drivers/gpu/mediatek/Makefile) or gate every
 	# SoC variant on wildcard presence instead of the platform's config. When
@@ -1177,6 +1206,8 @@ prepare_defconfig() {
 			esac
 		done
 	fi
+
+	fi   # end of NO_TREE_PATCHES -- every in-tree patch above is inside this
 
 	# A stable LOCALVERSION keeps artifact names predictable. Without this the
 	# tree appends "-dirty" as soon as any patch above touches a tracked file.
