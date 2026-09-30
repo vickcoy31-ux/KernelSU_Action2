@@ -28,6 +28,7 @@ declare -A DEFAULTS=(
 	[KERNEL_IMAGE_NAME]="Image.gz-dtb"
 	[ARCH]="arm64"
 	[KERNEL_NAME]=""
+	[KERNEL_LOCALVERSION]=""
 	[ADD_LOCALVERSION_TO_FILENAME]="false"
 	[EXTRA_CMDS]=""
 	[CUSTOM_CMDS]=""
@@ -112,8 +113,42 @@ cfg_read() {
 		| sed -E 's/[[:space:]]+$//'
 }
 
-resolve() {
-	local key val
+report_unknown_keys() {
+	local file=${1:-$CONFIG_FILE}
+	[ -f "$file" ] || return 0
+
+	local key unknown=0
+	# Only assignment lines count. Comments and blank lines are the majority of
+	# these files, and a key mentioned inside a comment is not being set.
+	while IFS= read -r key; do
+		case "$key" in
+		''|\#*) continue ;;
+		esac
+		# Leading whitespace before KEY= is accepted by cfg_read, so accept it
+		# here too rather than reporting a key that is in fact being read.
+		key=${key%%=*}
+		key=$(printf '%s' "$key" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+		[ -n "$key" ] || continue
+		# CONFIG_ENV is a real key of this system, but it is read from the
+		# environment or the workflow input, before DEFAULTS is walked, and it
+		# names the file being read -- so a `CONFIG_ENV=...` line inside that
+		# file does nothing. config.env carries one. It is accepted rather than
+		# reported so the warning stays about keys nothing reads at all.
+		if [ -z "${DEFAULTS[$key]+set}" ] && [ "$key" != "CONFIG_ENV" ]; then
+			warn "config: '${key}' is set in ${file} but is not a known key -- it will be ignored"
+			unknown=$((unknown + 1))
+		fi
+	done < <(grep -E '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$file" 2>/dev/null || true)
+
+	if [ "$unknown" -gt 0 ]; then
+		warn "config: ${unknown} key(s) in ${file} are not read by anything."
+		warn "config: A key that is misspelled, or that a script expects but this file"
+		warn "config: does not declare, produces a build that succeeds and is wrong."
+	fi
+	return 0
+}
+
+resolve() {	local key val
 	for key in "${!DEFAULTS[@]}"; do
 		val=${DEFAULTS[$key]}
 
@@ -258,6 +293,20 @@ declare -A CFG
 resolve
 apply_legacy_bridge
 validate
+
+# ------------------------------------------------------------ unknown keys ---
+# resolve() walks DEFAULTS and nothing else, so a key the config file sets but
+# DEFAULTS does not declare is dropped without a word. That cost run 36723484934
+# a full 55-minute build: config/gta9_vermagic.env set KERNEL_LOCALVERSION,
+# build.sh knew what to do with it, and the variable never reached the runner
+# because no one had told config.sh the key existed. The kernel built clean and
+# still carried the wrong release string, which on this device means no module
+# will load -- and the only symptom was a value that had silently reverted.
+#
+# A profile is a list of settings nobody re-reads after writing it, and a
+# misspelled or unregistered key there is indistinguishable from a typo in a
+# shell script except that it costs an hour. So name every one of them.
+report_unknown_keys
 
 # Derive the device label from the defconfig name, as before.
 DEVICE=$(printf '%s' "${CFG[KERNEL_CONFIG]}" | sed 's!.*/!!; s/_defconfig$//; s/_user$//; s/-perf$//')
