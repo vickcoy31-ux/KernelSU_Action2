@@ -34,7 +34,11 @@ jobs:
   build:
     name: gta9 (Android 12, 5.10.205)
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The full compile of 2,700-odd options with LTO measured 46 minutes and
+    # stopped at 34 on the first attempt, so 120 was measured against the wrong
+    # data. A timeout here would be a runner limit, not a config problem, and it
+    # would be indistinguishable from one in the log.
+    timeout-minutes: 180
     env:
       WORKSPACE: ${{ github.workspace }}/kernel_workspace
       CONFIG_ENV: ${{ inputs.config }}
@@ -109,7 +113,10 @@ jobs:
         if: env.ENABLE_CCACHE == 'true'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: gta9-android12-${{ env.KERNEL_VERSION }}
+          # Same key as Build Kernel on purpose. A different key is a different
+          # cache, so anything Build Kernel already compiled could not be reused
+          # here, and both workflows pay full price for the same objects.
+          key: kernel-${{ env.DEVICE }}-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}
           max-size: 2G
 
       # -k on purpose: the Makefile is given keep-going so that every error in

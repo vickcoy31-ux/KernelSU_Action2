@@ -130,6 +130,36 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# --------------------------------------------------------------- modules ---
+	# Patches 17, 19 and 20 below exist for one reason only: with
+	# CONFIG_MODULES=n, scripts/Makefile.build throws every 'obj-m' away and
+	# include/config/auto.conf rewrites every '=m' to '=y'. A modular build
+	# breaks that, and applying them anyway is actively harmful -- see patch 19,
+	# which forced gpueb into vmlinux and cost nine undefined symbols at the
+	# link because every symbol it calls (mtk_ipi_*, mtk_mbox_*, mtk_smem_init,
+	# ssc_vlogic_bound_*) lives in a .ko that vmlinux cannot see.
+	#
+	# So ask the defconfig, and let EXTRA_DEFCONFIG override it: that loop runs
+	# later (the end of this function) and would otherwise turn the answer into
+	# a lie. Kconfig's own default for MODULES is y, so a defconfig that never
+	# mentions it is a modular build.
+	modules_on() {
+		local v=
+		v=$(printf '%s' "${EXTRA_DEFCONFIG:-}" | tr '\n' ' ' |
+			grep -oE '(^| )CONFIG_MODULES=[a-z]+' |
+			tail -1 | cut -d= -f2)
+		[ -n "$v" ] || v=$(sed -nE 's/^CONFIG_MODULES=([a-z]+)$/\1/p' \
+			"$DEFCONFIG_PATH" 2>/dev/null | head -1)
+		[ "$v" = "n" ] && return 1
+		return 0
+	}
+
+	if modules_on; then
+		info "MODULES: on -- patches 17/19/20 (obj-m workarounds) will be skipped"
+	else
+		info "MODULES: off -- patches 17/19/20 (obj-m workarounds) will apply"
+	fi
+
 	# Vendor trees routinely ship multi-platform .c files behind 'obj-y' even
 	# when the driver is '=m' (see drivers/gpu/mediatek/Makefile) or gate every
 	# SoC variant on wildcard presence instead of the platform's config. When
@@ -624,11 +654,18 @@ prepare_defconfig() {
 	#     the three directories reachable and build the object unconditionally.
 	#     The file includes only its own header and <linux/module.h>, so it
 	#     stands alone.
+	#
+	#     Only for a monolithic build -- see modules_on() above. With modules on,
+	#     mtk-afe-external.o becomes a .ko that resolves those two symbols itself,
+	#     and the three obj-y lines below would drag sound/soc/mediatek/common
+	#     into vmlinux for no reason.
 	local snd_mk="${KERNEL_DIR}/sound/Makefile"
 	local soc_mk="${KERNEL_DIR}/sound/soc/Makefile"
 	local mtk_soc_mk="${KERNEL_DIR}/sound/soc/mediatek/Makefile"
 	local afe_mk="${KERNEL_DIR}/sound/soc/mediatek/common/Makefile"
-	if [ -f "$snd_mk" ] && [ -f "$soc_mk" ] && [ -f "$mtk_soc_mk" ] && [ -f "$afe_mk" ]; then
+	if modules_on; then
+		info "AFE: skipped, mtk-afe-external.o stays obj-m (modules are on)"
+	elif [ -f "$snd_mk" ] && [ -f "$soc_mk" ] && [ -f "$mtk_soc_mk" ] && [ -f "$afe_mk" ]; then
 		# Each of these is idempotent, and only ever adds the one directory
 		# that Kbuild would otherwise skip. Every other entry in those three
 		# Makefiles stays gated on its own CONFIG_*, so nothing else is built.
@@ -653,8 +690,24 @@ prepare_defconfig() {
 	#     exists, defaults to n, and is referenced by nothing at all. Same
 	#     treatment as patch 17 -- obj-m becomes obj-y. Disabling the consumer
 	#     is not an option, it is the GPU driver itself.
+	#
+	#     This one is the most expensive of the three when it is wrong. Applied to
+	#     a modular build it pulled all nine gpueb objects into vmlinux, and
+	#     vmlinux then needed every symbol they call:
+	#         mtk_ipi_register, mtk_ipi_send_compl, mtk_ipi_device_register,
+	#         ipi_monitor_dump            <- CONFIG_MTK_IPI=m
+	#         mtk_mbox_probe, mtk_mbox_write  <- CONFIG_MTK_MBOX=m
+	#         mtk_smem_init               <- smem is a module
+	#         ssc_vlogic_bound_register_notifier,
+	#         ssc_vlogic_bound_unregister_notifier  <- CONFIG_MTK_SSC_MODULE=m
+	#     Nine undefined symbols, all reported against vmlinux.o, all traceable
+	#     to this one sed. With modules on none of it applies: gpueb.ko exports
+	#     those names and modpost resolves them the way it resolves every other
+	#     module's. CONFIG_MTK_GPU_SUPPORT stays =m either way.
 	local gpueb_mk="${KERNEL_DIR}/drivers/gpu/mediatek/gpueb/Makefile"
-	if [ -f "$gpueb_mk" ] && grep -q '^obj-m += gpueb\.o$' "$gpueb_mk"; then
+	if modules_on; then
+		info "GPUEB: skipped, gpueb.o stays obj-m (modules are on)"
+	elif [ -f "$gpueb_mk" ] && grep -q '^obj-m += gpueb\.o$' "$gpueb_mk"; then
 		sed -i 's/^obj-m += gpueb\.o$/obj-y += gpueb.o/' "$gpueb_mk"
 		if grep -q '^obj-y += gpueb\.o$' "$gpueb_mk"; then
 			info "GPUEB: built into vmlinux (was obj-m, dead with MODULES=n)"
@@ -684,8 +737,13 @@ prepare_defconfig() {
 	#     FDVT_USE_GCE unconditionally, outside any #if, and the secure path is
 	#     reached from FDVT_open/FDVT_release with only a NULL check. There is
 	#     no config switch that turns it off in that file.
+	#
+	#     The rewrite is only correct in a y/n world. With CONFIG_MODULES=y the
+	#     author gets what they wrote, so leave the line alone there.
 	local cmdq_mk="${KERNEL_DIR}/drivers/misc/mediatek/cmdq/mailbox/Makefile"
-	if [ -f "$cmdq_mk" ] && grep -q 'ifeq ($(CONFIG_MTK_GZ_TZ_SYSTEM),m)' "$cmdq_mk"; then
+	if modules_on; then
+		info "CMDQ: skipped, the 'ifeq ...,m' guard is already correct (modules are on)"
+	elif [ -f "$cmdq_mk" ] && grep -q 'ifeq ($(CONFIG_MTK_GZ_TZ_SYSTEM),m)' "$cmdq_mk"; then
 		sed -i 's|ifeq ($(CONFIG_MTK_GZ_TZ_SYSTEM),m)|ifneq ($(CONFIG_MTK_GZ_TZ_SYSTEM),)|' "$cmdq_mk"
 		if grep -q 'ifneq ($(CONFIG_MTK_GZ_TZ_SYSTEM),)' "$cmdq_mk"; then
 			info "CMDQ: secure mailbox guard now accepts y (m is transposed to y here)"
