@@ -205,8 +205,22 @@ prepare_defconfig() {
 
 	if [ -n "${PATCH_WHITELIST:-}" ]; then
 		local pe
-		pe=$(printf '%s' "$PATCH_WHITELIST" | tr ' ' '\n' | grep -cE '^[0-9]+$' | head -1)
-		info "PATCH_WHITELIST = ${PATCH_WHITELIST} (${pe:-0} patch(es); the rest are skipped)"
+		# Count the numbers in the list, whichever separator is used. The first
+		# version of this was
+		#
+		#   pe=$(printf '%s' "$PATCH_WHITELIST" | tr ' ' '\n' | grep -cE '^[0-9]+$')
+		#
+		# which only splits on spaces, so a profile written with commas -- which
+		# is how config/gta9_4patch.env writes it -- passed through unsplit, no
+		# line matched ^[0-9]+$, grep exited 1, and under pipefail the assignment
+		# itself became the failure. Run #114 died there in seconds, with
+		# "build.sh failed at line 208: head -1" naming the last element of the
+		# pipeline rather than the one that exited non-zero.
+		#
+		# grep -o pulls every number out regardless of separator, and wc -l
+		# cannot fail, so the count is right and the status is always zero.
+		pe=$(printf '%s' "$PATCH_WHITELIST" | grep -oE '[0-9]+' | wc -l)
+		info "PATCH_WHITELIST = ${PATCH_WHITELIST} (${pe} patch(es); the rest are skipped)"
 	else
 		info "PATCH_WHITELIST is empty: all 29 patches will run"
 	fi
