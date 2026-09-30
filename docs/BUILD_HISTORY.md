@@ -8,6 +8,43 @@ attempt does not repeat an approach that was already shown to fail. Update this
 file in the same commit that changes `config.env`, `scripts/build.sh`, or the
 workflows.
 
+---
+
+> ## ⚠️ READ THIS BEFORE §1
+>
+> **Everything below the line was written up to run #89. §6 covers runs #89 to
+> #111 and reverses two of its conclusions. Do not act on §1–§5 without reading
+> §6 first.**
+>
+> **1. "Do NOT fix this with `CONFIG_MODULES=y`" (§1) is wrong, and following it
+> is what cost runs #90–#111.** The objection recorded there was that a modular
+> build's `.ko` files "were not built against this config and would not load".
+> That is true, and it is *also true of the monolithic build* — the objection
+> was never a reason to prefer monolithic. A modular build reached a clean link
+> in one attempt (`fd83e99` onward); the monolithic build never did, because
+> `init/Kconfig` here has no `default y` for `CONFIG_MODULES`, so the transpose
+> in `scripts/kconfig/symbol.c` turns every `=m` into `=y` and 191 per-SoC
+> objects enter `vmlinux` at once. Which of them collide is the linker's
+> decision, so the list was unbounded: #107 needed nine pins, #108 then produced
+> nineteen duplicates from a completely different set.
+>
+> **2. "STATUS: the build works" was true of the build and false of the kernel.**
+> Run #88 emitted a valid 8,308,668-byte `Image.gz` and reported
+> `5.10.205-ga5002f750537-dirty` as its release. That string is already wrong.
+> The device's modules are built against `5.10.205-android12-9-28698995`, and
+> `insmod` compares that string. Run #111 finally got a boot image that was
+> correct in every other respect and it still would not have worked, for exactly
+> this reason. **A clean build has never been the thing that was missing.**
+>
+> **3. `gta9_00_defconfig` is the wrong base, and §1's diagnosis of why was also
+> the wrong reason.** It is a truncated copy, yes — but the fix is not to fill
+> its gaps. It is the device's own config, read out of the stock `boot.img`
+> (`IKCFG_ST` at offset `0x1834220`, 217,350 bytes). §6 has the details.
+
+---
+
+## STATUS: superseded — see §6
+
 ## STATUS: the build works
 
 **Run #88 (commit `3cab9e6`) and run #89 (commit `2148478`) both succeeded.**
@@ -1065,3 +1102,269 @@ thing to try.
   anything.** `config.env`, `scripts/*.sh` and both workflows never mention
   `defconfig_fragments`. Its `CONFIG_MTK_MKP=n` / `CONFIG_MTK_PERF_*=n` entries
   are duplicated in `EXTRA_DEFCONFIG` instead. Either wire it in or delete it.
+
+---
+
+# 6. Runs #89–#111: the build was never the problem
+
+Twenty-three runs, five commits, and the conclusion is uncomfortable: **every
+approach in §1–§5 was aimed at making a kernel that would not link, while the
+thing that actually determines whether the tablet works is a string that no
+amount of linking fixes.**
+
+## 6.1 The base config came out of the device, not out of the repo
+
+`gta9_00_defconfig` is 478 compiled options, and the kernel it produced reached
+userspace and restarted: `CONFIG_ARM_GIC`, `CONFIG_ARM_GIC_V3`, ten `COMMON_CLK`
+drivers, `CONFIG_OF_RESERVED_MEM`, `CONFIG_INTERCONNECT` and every
+`CONFIG_DRM_LCD_*` panel are simply absent. There is no configuration in this
+tree that both has the drivers and belongs to branch `14.0`, so the base became
+the device's own, extracted from the stock `boot.img`:
+
+```
+IKCFG_ST  at offset 0x1834220
+217,350 bytes
+2,721 CONFIG_ options   (6,431 lines including comments and menu entries)
+```
+
+That file is the only authoritative config for this device, and it is modular:
+`CONFIG_MODULES=y`. It is stored in this repo as `config/gta9_stock_defconfig`.
+
+The build's resolved `.config` comes out at 2,714 options — seven fewer, which
+are the `MT6983` pins from `EXTRA_DEFCONFIG`, and nothing else. Five values
+differ from the tablet's. That is worth stating precisely, because it is what
+bounds the remaining risk in §6.5: the built-in symbol set is very nearly
+identical to the one the tablet's modules were compiled against.
+
+## 6.2 Going modular is what fixed it, and §1 argued against it
+
+The transposition in `scripts/kconfig/symbol.c` is real and §1 documents it
+correctly:
+
+```c
+if (val == mod)
+        if (!sym_is_choice_value(sym) && modules_sym->curr.tri == no)
+                val = yes;
+```
+
+`init/Kconfig` here has no `default y` for `CONFIG_MODULES`, so it resolves to
+`n` unless something sets it, and then **every** `=m` in the defconfig becomes
+`=y`. The device's own config sets it to `y` explicitly, which is why using that
+config is what makes the transpose stop firing.
+
+With modules on, 191 per-SoC options stay as 191 separate `.ko` files instead of
+colliding inside `vmlinux`, and the whole class of "duplicate symbol" failures
+disappears. Commit `532284f` removed `CONFIG_MODULES=n` from `config.env` for
+this reason.
+
+**It did not work immediately, and the reason is the most useful thing in this
+section.** `532284f` left four patches in `scripts/build.sh` that had been
+written for the monolithic world, and all four are actively harmful under
+modules:
+
+| patch | what it does | why it only ever made sense with `MODULES=n` |
+| --- | --- | --- |
+| 5 | deletes the frame-sync objects from `imgsensor_isp6s-objs` | the duplicate was across two *modules* |
+| 17 | `obj-m` → `obj-y` for `mtk-afe-external.o` | `obj-m` builds nothing when modules are off |
+| 19 | `obj-m` → `obj-y` for `gpueb.o` | same |
+| 20 | `ifeq ($(CONFIG_MTK_GZ_TZ_SYSTEM),m)` → `ifneq (...,)` | the literal `m` only misbehaves once transposed |
+
+Patch 19 alone caused all nine undefined symbols of run `36704893015`. It pulls
+nine objects into `vmlinux`, and `vmlinux` then needs every symbol they call —
+`mtk_ipi_register`, `mtk_ipi_send_compl`, `mtk_ipi_device_register`,
+`ipi_monitor_dump` (`CONFIG_MTK_IPI=m`), `mtk_mbox_probe`, `mtk_mbox_write`
+(`CONFIG_MTK_MBOX=m`), `mtk_smem_init` (smem is a module) and
+`ssc_vlogic_bound_{register,unregister}_notifier` (`CONFIG_MTK_SSC_MODULE=m`).
+Every one of them was reported against `vmlinux.o`, and every `referenced by`
+line named a file under `drivers/gpu/mediatek/gpueb/`.
+
+They are all behind `modules_on()` in `scripts/build.sh` now, which asks the
+defconfig and lets `EXTRA_DEFCONFIG` override it — the loop that applies
+`EXTRA_DEFCONFIG` runs *later* in `prepare_defconfig`, so reading the file alone
+would report the wrong answer for the profile that pins `CONFIG_MODULES=n`. A
+defconfig that does not mention `CONFIG_MODULES` is modular, because that is
+kconfig's default.
+
+**Patch 5 is the clearest illustration of the mistake.** There are two
+`frame_sync_drv.mk` files and they append to *different* object lists:
+
+```
+src/common/v1_1/n3d_fsync/frame-sync/frame_sync_drv.mk -> imgsensor_isp6s-objs
+    -> imgsensor_isp6s.ko    CONFIG_MTK_IMGSENSOR=m
+src-v4l2/frame-sync/frame_sync_drv.mk                  -> imgsensor-objs
+    -> imgsensor.ko          CONFIG_MTK_V4L2_IMGSENSOR=m
+```
+
+Two modules each carrying their own `frame_sync.o` is ordinary, and modpost does
+not compare globals between modules. Only when `CONFIG_MODULES=n` folded both
+into `vmlinux` did they collide. Patch 5 removed the objects from the isp6s copy
+anyway, which also removed the definition of `FrameSyncInit`, and `n3d.c:691`
+still calls it. The duplicate it was written to kill did not exist; the symbol
+it broke was real.
+
+## 6.3 Two upstream defects, not ours
+
+Neither is a config problem and neither is fixable by configuration.
+
+**`show_stack` arity.** `connectivity_build_in_adapter.c` calls it with three
+arguments in a kernel whose `show_stack` takes two. It is present in three of
+the four public MT6789 trees, so it is not this fork. Patched in
+`patches/gta9-connectivity-show-stack-signature.patch`.
+
+**`gpudfd_mt6895`.** `drivers/gpu/mediatek/gpufreq/v2/Makefile` gives every
+per-SoC object set a gpudfd file except MT6895's:
+
+```make
+mtk_gpufreq_mt6789-y := ... gpufreq_mt6789.o gpudfd_mt6789.o
+mtk_gpufreq_mt6833-y := ... gpufreq_mt6833.o gpudfd_mt6833.o
+mtk_gpufreq_mt6855-y := ... gpufreq_mt6855.o gpudfd_mt6855.o
+mtk_gpufreq_mt6879-y := ... gpufreq_mt6879.o gpudfd_mt6879.o
+mtk_gpufreq_mt6893-y := ... gpufreq_mt6893.o gpudfd_mt6893.o
+mtk_gpufreq_mt6895-y := ... gpufreq_mt6895.o            <- no gpudfd
+mtk_gpufreq_mt6983-y := ... gpufreq_mt6983.o gpudfd_mt6983.o
+```
+
+`gpufreq_mt6895.c` calls `gpudfd_init`, and the `obj-` line is still gated on
+`gpudfd_mt6895.c` existing, so the wildcard test passes and the module is built
+without the object it needs. GTA9 is MT6789, so patches 1/3/4's "keep only
+mt6789" treatment is applied to it as well (patch 29).
+
+## 6.4 Run #111: a clean build at last
+
+```
+compile errors    0
+undefined symbols 0
+duplicate symbols 0
+modpost errors    0
+
+GZIP    arch/arm64/boot/Image.gz
+kernel release  5.10.205-gta9-ga5002f750537
+```
+
+Artifacts: `Image.gz` 18,903,927 B (→ `Image` 39,823,872 B), `AnyKernel3`
+21,984,555 B, `.config` 48,946 B. 54m44s.
+
+Repacked locally against the tablet's own `boot.img.lz4` (sha256
+`B361173E…F3744`, pinned):
+
+```
+new-boot.img       67,108,864 B   ANDROID! magic
+arm64 Image magic  ARM\x64 at offset 56, reserved fields identical to stock
+ramdisk.cpio       byte-identical to stock
+only the kernel differs; every other component byte-identical
+ReSukiSU present, 397 KernelSU strings   (stock: 0 of each)
+```
+
+**Three counts went to zero, and the kernel still could not be used.** That is
+the whole lesson of runs #89–#111.
+
+## 6.5 The thing that actually matters: vermagic
+
+```
+stock   5.10.205-android12-9-28698995
+built   5.10.205-gta9-ga5002f750537
+```
+
+The device is modular. It loads drivers from `/vendor_dlkm`, and those are the
+`.ko` files Samsung built, each carrying the vermagic that build produced.
+`insmod` compares it:
+
+```
+insmod: version magic '5.10.205-android12-9-28698995' should be
+        '5.10.205-gta9-ga5002f750537'
+```
+
+Every module fails. A tablet with no modules does not reach userspace. **Odin
+reports success throughout**, because nothing about flashing a boot image is
+wrong — the failure only appears as a device that restarts.
+
+Note that run #88's kernel was already wrong in this way: it reported
+`5.10.205-ga5002f750537-dirty`. Every kernel this project has ever produced
+would have been refused by the device's module loader.
+
+Two facts make this fixable rather than a dead end:
+
+```
+# CONFIG_MODULE_SIG is not set     (stock and ours)
+CONFIG_MODVERSIONS=y               (stock and ours)
+```
+
+No module is signed, so there is no key to obtain and no signature to forge.
+The check is the version string, plus symbol CRCs that the same source tree
+produces. The string is the only thing in the way, and it is a string we set.
+
+```ini
+KERNEL_LOCALVERSION=-android12-9-28698995   # config/gta9_vermagic.env
+```
+
+`build.sh` also turns `CONFIG_LOCALVERSION_AUTO` off with it, because otherwise
+`scripts/setlocalversion` appends this tree's git describe (`-ga5002f750537`, or
+`-dirty` once a patch touches a tracked file) and the string stops matching
+again. Pinning a localversion and asking for a moving one is contradictory, so
+the pin wins.
+
+`.github/workflows/gta9-odin.yml` fails the run if that exact string is not
+found in the built `Image`, because a mismatch is invisible in every other part
+of a successful build.
+
+**Residual risk, stated plainly:** `CONFIG_MODVERSIONS=y` means symbol CRCs are
+compared. The resolved `.config` differs from the tablet's in five values and
+omits seven options (the `MT6983` pins), so a module touching one of those could
+still fail with *"disagrees about version of symbol"*. That cannot be ruled out
+without the device.
+
+## 6.6 Two config mistakes that cost a full build each
+
+**`KCFLAGS` was retyped instead of copied.** The first modular run
+(`36700720837`) compiled for 33 minutes and then stopped on
+
+```
+drivers/samsung/sec_hard_reset_hook.c:236:46: error: '/*' within block
+comment [-Werror,-Wcomment]
+```
+
+which is a warning that became an error only because the profile did not carry
+the `KCFLAGS` line the working profile had. It was fixed by copying the 323
+characters across, not by writing them out again. **When a profile is derived
+from a working one, copy the values; do not retype them.** The same mistake was
+caught a second time while creating `config/gta9_vermagic.env` and was fixed
+before the run.
+
+**`KERNEL_IMAGE_NAME` was absent.** It defaults to `Image.gz-dtb`, the GKI name.
+This tree is not GKI — it has a device tree, `gta9_00`, for MT8781 — and the
+build writes `Image.gz`. The upload step looked for a file that was never
+produced and reported a failure that had nothing to do with the build.
+
+## 6.7 Where things stand
+
+| | |
+| --- | --- |
+| build | clean, reproducible, ~55 min, ccache-warm afterwards |
+| boot image | repacks the tablet's own stock `boot.img`, ramdisk byte-identical |
+| base config | the device's own, read out of the stock `boot.img` |
+| modules | modular, as the device expects |
+| release string | pinned to the tablet's; checked by the workflow |
+| ReSukiSU | integrated, tracepoint hook, verified present in the image |
+| WiFi/BT | `CONFIG_MTK_COMBO` never pinned |
+| unverified | everything that needs the device: boot, module load, symbol CRCs |
+
+Device-side state: stock, unmodified. `system` and `vendor` are untouched, and
+`vendor_dlkm` still holds Samsung's own modules, which is what makes the
+vermagic approach work at all.
+
+Recovery, if a flash goes wrong: the pristine
+`AP_XID-X110XXS4BYBF-20250304193711.tar` (20,862,770 B, verified) still holds
+the original `boot.img.lz4`.
+
+## 6.8 If picking this up cold
+
+1. Read §6 before §1. §1 recommends a monolithic build and it is wrong.
+2. Do not touch `config/gta9_stock_defconfig`. It is the device's config.
+3. Never pin `CONFIG_MODULES=n`. It is what produced the unbounded duplicate
+   pile in §1–§5 and it is what `modules_on()` now exists to prevent.
+4. Never pin `CONFIG_MTK_COMBO`. A kernel without the WiFi/Bluetooth combo chip
+   is a tablet that cannot connect to anything.
+5. Do not add a patch without a comment saying which `CONFIG_MODULES` state it
+   assumes. Four of them were wrong for twenty runs for exactly that reason.
+6. Before a run, check what actually changed. Two of the last three runs failed
+   on a profile value that a diff would have shown in one second.
