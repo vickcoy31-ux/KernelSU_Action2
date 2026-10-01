@@ -108,6 +108,28 @@ susfs_apply() {
 		}
 	fi
 
+	# 4. Tree-local corrections for this device's kernel.
+	#
+	# The gki-android12-5.10 patch assumes a vm_area_struct that has a
+	# vm_pad_start field, and reads the end address of a VMA through
+	# VMA_PAD_START(). That field and macro arrived with the
+	# CONFIG_ARCH_VMAP_STACK rework after 5.10; this tree has neither, so the
+	# build compiled every object and then failed to link:
+	#
+	#   ld.lld: error: undefined symbol: VMA_PAD_START
+	#
+	# Run 36837265931 is where that happened. The correction replaces the macro
+	# with vma->vm_end, which is what the unpatched show_map_vma a few lines
+	# above already uses, so the two branches then agree.
+	#
+	# Idempotent like the rest of this file: already-applied is not an error.
+	local treefix
+	for treefix in "${REPO_ROOT}"/patches/gta9-susfs-*.patch; do
+		[ -f "$treefix" ] || continue
+		apply_patch "$treefix" 1 \
+			|| die "tree-local SUSFS correction failed: $(basename "$treefix")"
+	done
+
 	# Record the SUSFS version for the build summary.
 	local sv
 	sv=$(sed -nE 's/.*SUSFS_VERSION[[:space:]]+"([^"]+)".*/\1/p' \

@@ -1,0 +1,49 @@
+fs/proc/task_mmu.c: show_map_vma() reads VMA_PAD_START, which does not exist here.
+#
+# susfs4ksu's gki-android12-5.10 patch uses VMA_PAD_START(vma) for the end
+# address in the open-redirect branch of show_map_vma. That macro comes from the
+# CONFIG_ARCH_VMAP_STACK rework that landed after 5.10, which adds a vm_pad_start
+# field to struct vm_area_struct. This tree has neither the macro nor the field:
+#
+#   torvalds/linux v5.10      include/linux/mm_types.h   no VMA_PAD_*
+#   android-common-5.10                                 no VMA_PAD_*
+#   kernelvalidevo 14.0                                 no VMA_PAD_*
+#
+# So the patch's assumption does not hold, and run 36837265931 failed at link,
+# not at compile, after every object file had already built:
+#
+#   ld.lld: error: undefined symbol: VMA_PAD_START
+#   make[1]: *** [Makefile:1335: vmlinux] Error 1
+#
+# One line uses it, inside CONFIG_KSU_SUSFS_OPEN_REDIRECT. The unpatched
+# show_map_vma in this same file already computes the end address as vma->vm_end,
+# and JackA1ltman's susfs_patch_to_5.4.patch, written for non-GKI trees like this
+# one, uses vma->vm_end at exactly this spot. For any VMA without padding -- all
+# of them here, since the field does not exist -- the two are the same value. So
+# this changes no behaviour; it only makes the redirect branch agree with the
+# branch directly above it.
+#
+# Dropping the OPEN_REDIRECT branch entirely was the other option and would have
+# been worse. It is a documented feature, the manager lists open_redirect among
+# its toggles, and it is one reason 24 files are patched at all.
+#
+# Context lines below are copied byte for byte out of the patched tree. An
+# earlier version of this file was written by hand from terminal output, which
+# renders tabs as spaces, and patch(1) rejected it.
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -490,13 +490,13 @@
+ 			char *spoofed_redirected_name = NULL;
+ 			int srcu_idx = srcu_read_lock(&susfs_srcu_open_redirect);
+ 			int ret = susfs_open_redirect_spoof_show_map_vma_srcu(inode, &ino, &dev, &spoofed_redirected_name);
+ 			if (!ret) {
+ 				pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+ 				start = vma->vm_start;
+-				end = VMA_PAD_START(vma);
++				end = vma->vm_end;
+ 				show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
+ 				seq_pad(m, ' ');
+ 				if (spoofed_redirected_name)
+ 					seq_puts(m, spoofed_redirected_name);
+ 				seq_putc(m, '\n');
+ 				srcu_read_unlock(&susfs_srcu_open_redirect, srcu_idx);
