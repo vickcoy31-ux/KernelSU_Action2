@@ -6,3 +6,7 @@ __pycache__/
 /ramdisk.cpio
 *.img
 *.ko
+
+# monitor state, not source
+tools/watch.log
+tools/watch_state.json
