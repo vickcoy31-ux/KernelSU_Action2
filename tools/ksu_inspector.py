@@ -600,9 +600,11 @@ class App(tk.Tk):
         return t
 
     def show(self, name):
-        for n, f in self._pages.items():
-            if n != 'Ubah (tulis)':
-                f.place_forget()
+        # Every page is forgotten, the write tab included. Skipping it left that
+        # one permanently placed, so once it was opened it sat on top of
+        # everything and no pill could be reached to switch away from it again.
+        for f in self._pages.values():
+            f.place_forget()
         self._pages[name].place(relwidth=1, relheight=1)
         for n, b in self._pills.items():
             on = (n == name)

@@ -101,7 +101,43 @@ check('json list kosong', _json_list('[]'), [])
 check('json list isi', _json_list('["a","b"]'), ['a', 'b'])
 check('json rusak jadi baris', _json_list('[oops\nx'), ['[oops', 'x'])
 
-print()
+print("\n=== tab: hanya satu boleh terlihat, dan semua bisa dipilih ===")
+# The write tab used to be left permanently placed, so opening it covered every
+# other tab and the pills could not be reached to switch away. Nothing else in
+# the code notices that, so it needs a check of its own.
+#
+# The except below is deliberately narrow. An earlier version caught Exception,
+# which swallowed a TypeError from this very block and printed "no display",
+# and the run came out green while testing nothing.
+import tkinter as tk                                        # noqa: E402
+import ksu_inspector as K                                    # noqa: E402
+
+app = K.App()
+app.update()
+bad = []
+for target in K.App.TABS:
+    app.show(target)
+    app.update()
+    shown = [n for n, f in app._pages.items() if f.winfo_ismapped()]
+    if shown != [target]:
+        bad.append((target, shown))
+# check() here compares got == want, so the condition has to be compared to True.
+check('tiap tab menyisakan tepat satu halaman terlihat', not bad, True)
+for t, p in bad:
+    print(f'         setelah pilih {t!r}, yang terlihat: {p}')
+    fails.append('tab tidak berganti')
+
+# The order that actually broke: open the write tab, then try to leave it.
+app.show('Ubah (tulis)')
+app.update()
+check('tab tulis bisa dibuka',
+      [n for n, f in app._pages.items() if f.winfo_ismapped()], ['Ubah (tulis)'])
+app.show('Ringkasan')
+app.update()
+shown = [n for n, f in app._pages.items() if f.winfo_ismapped()]
+check('bisa kembali setelah buka tab tulis', shown, ['Ringkasan'])
+app.destroy()
+
 if fails:
     print(f"GAGAL {len(fails)}: " + ", ".join(fails))
     sys.exit(1)
