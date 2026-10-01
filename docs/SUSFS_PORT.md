@@ -55,68 +55,135 @@ kernel_patches/50_add_susfs_*.patch       88,687 B   hooks 24 kernel files
 kernel_patches/KernelSU/10_enable_*.patch 110,857 B   hooks the KernelSU driver
 ```
 
-Each file was fetched from the tree and tested on its own with `git apply
---check`, because `git apply` is atomic: one file that will not match makes the
-whole patch fail and the error output then names every file in it.
+### The kernel side applies completely
 
 ```
-kernel side, against vickcoy31-ux/kernelvalidevo 14.0
-  22 of 24 files clean
-  106 of 124 hunks, 85.5%
-  manual: fs/namespace.c (10 hunks), fs/proc/task_mmu.c (8 hunks)
-    namespace.c wants #include <linux/fs_context.h> and a pnode.h include in a
-      particular order; this tree is older and has neither in that order
-    task_mmu.c wants a show_map_vma signature this tree spells differently
-
-KernelSU side, against the driver each fork ships
-  against ReSukiSU/ReSukiSU@main        4 of 95 hunks,  4.2%   4 of 28 files
-  against SukiSU-Ultra/SukiSU-Ultra@main 59 of 95 hunks, 62.1%  21 of 28 files
+cd tree && patch -p1 --force --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+  hunks succeeded   : 70
+  hunks with fuzz 3 :  1
+  hunks failed      :  0
+  .rej files        :  0
+  files changed     : 24 of 24
+  "susfs" in tree   : 384 occurrences
 ```
 
-That second table is the finding. The KernelSU-side patch is written against
-SukiSU-Ultra's driver. It fits that driver for 62% of its hunks and ReSukiSU's
-for 4%. ReSukiSU is a re-fork that has moved on, so this patch was never going
-to land on it.
+All 24 files. No manual work on the kernel side.
+
+The one hunk that attached with fuzz 3 is `fs/namespace.c`'s include block, and
+it landed correctly:
+
+```c
+#include <linux/fslog.h>
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif
+#include "pnode.h"
+#include "internal.h"
+```
+
+`scripts/lib.sh:apply_patch` tries no-fuzz first, then a reverse check for
+already-applied, then `--fuzz=3`, and only fails if all three miss. So this is
+the path CI actually takes, and it succeeds.
+
+### The two sides share exactly one contract
+
+Every `extern` the kernel patch introduces was checked against where it is
+defined. Ten of eleven resolve inside the kernel side itself -- five are
+`DEFINE_STATIC_KEY_FALSE/TRUE` symbols, `susfs_srcu_open_redirect` is a
+`DEFINE_SRCU(...)` in `fs/susfs.c:873`, `susfs_fake_qstr_name` is a
+`QSTR_INIT` in `fs/susfs.c:48`, and the rest are static functions the kernel
+patch defines in the same file it calls them from.
+
+Two do not:
+
+```
+security/selinux/avc.c:2512  +extern u32 susfs_ksu_sid;
+security/selinux/avc.c:2513  +extern u32 susfs_priv_app_sid;
+
+10_enable_susfs_for_ksu.patch:2454  +u32 susfs_ksu_sid      __read_mostly = 0;
+10_enable_susfs_for_ksu.patch:2458  +u32 susfs_priv_app_sid __read_mostly = 0;
+```
+
+So two globals are what the kernel side needs from the driver side in order to
+link. That is a much smaller thing than the patch's 95 hunks, though it is not
+the whole of what the feature needs: the `0x555e1`/`0x555e2`/`0x555e3` command
+handlers that `ksud susfs show` sends also live in the driver-side patch, and
+without them the kernel builds but still answers "unsupported" to the manager.
+
+### The driver side is the real work
+
+```
+against ReSukiSU/ReSukiSU@main        4 of 95 hunks,  4.2%
+against SukiSU-Ultra/SukiSU-Ultra@main 59 of 95 hunks, 62.1%
+```
+
+That is the finding. The KernelSU-side patch is written against SukiSU-Ultra's
+driver. It fits that driver for 62% of its hunks and ReSukiSU's for 4%.
+
+Its changes are not additive. They are a coordinated change to the execve hook
+path, and the signatures have to agree across ten files:
+
+```c
+// adb_root.h: two pt_regs handlers collapse into one that takes a path
+-long ksu_adb_root_handle_execve(struct pt_regs *regs);
+-long ksu_adb_root_handle_execveat(struct pt_regs *regs);
++long ksu_adb_root_handle_execveat(const char *filename, void __user ***envp_user_ptr);
+
+// sulog/event.h: one capture function is removed, the other changes shape
+-struct ksu_sulog_pending_event *ksu_sulog_capture_root_execve(const char __user *filename_user, ...);
+-struct ksu_sulog_pending_event *ksu_sulog_capture_sucompat(const char __user *filename_user, ...);
++struct ksu_sulog_pending_event *ksu_sulog_capture_sucompat(const char *filename,
++                                                           struct user_arg_ptr *argv_user, gfp_t gfp);
+```
+
+Because of that, the driver-side port cannot be done hunk by hunk. It is one
+change to the hook path, and the signatures must line up across every file that
+touches it.
 
 ## What that costs
 
 ```
 stay on ReSukiSU
-  kernel side   2 files by hand, roughly 2 to 4 hours
-  driver side   91 of 95 hunks by hand: a rewrite of the SUSFS integration
-                into ReSukiSU's driver. Developer work, not configuration.
+  kernel side   done. patch(1) applies all 24 files as-is.
+  driver side   91 of 95 hunks, as a coordinated rewrite of the execve hook
+                path rather than 91 independent edits.
 
 switch to SukiSU-Ultra
-  kernel side   2 files by hand
-  driver side   36 of 95 hunks by hand
+  kernel side   done, identical
+  driver side   36 of 95 hunks
   loses ReSukiSU as a variant and its manager
 ```
 
-Neither is a one-line change to a defconfig.
-
 ## Corrections made while working this out
 
-Three conclusions in this document were wrong on the way here, all from the
-measuring rather than from the kernel.
+Several conclusions here were wrong on the way, all from the measuring rather
+than from the kernel. They are listed because each one changed a decision.
 
-**"THREAD_INFO_IN_TASK is absent."** It was grepped in `arch/arm64/Kconfig`, which
-is where an arch-specific option would be. It is defined in `init/Kconfig` and
-has been present all along, with 20 references in `include/linux/thread_info.h`.
+**"THREAD_INFO_IN_TASK is absent."** Grepped in `arch/arm64/Kconfig`, which is
+where an arch-specific option would be. It is in `init/Kconfig` and has 20
+references in `include/linux/thread_info.h`.
 
-**"All 24 kernel files fail to apply."** `git apply` is atomic. One file that
-will not match fails the entire patch and the error output names every file in
-it, so 22 files that apply cleanly were reported as failures.
+**"All 24 kernel files fail to apply."** `git apply` is atomic: one file that
+will not match fails the whole patch and the error output then names every file
+in it. 22 files applied cleanly and were reported as failures.
 
-**"This port is several days."** That followed from the line above. On the kernel
-side the work is two files.
+**"This port is several days."** Followed from the line above.
 
-A fourth measurement bug was in this project's own per-file splitter, which then
-reported 22 clean files as failing. The per-file numbers above come from a
-rewrite using an extraction method that had been verified against a single file
-first.
+**"Two kernel files need hand-writing."** Still wrong, and wrong because of the
+tool. All of this section measured with `git apply`, but CI applies patches with
+`patch(1)` via `lib.sh:apply_patch`, which retries at `--fuzz=3`. Under the tool
+the build uses, all 24 files apply and neither needs hand-writing.
 
-The pattern is the same one that has run through this project repeatedly: an
-empty or negative result from a tool gets read as a fact about the device. The
+**"16 symbols have no definition, so the kernel cannot link."** A regex guessed
+that function definitions always put the return type and name on one line. Most
+of the 16 are defined -- as `DEFINE_STATIC_KEY_FALSE`, `DEFINE_SRCU`,
+`QSTR_INIT`, or static functions. Two genuinely come from the driver patch, and
+the number is now known rather than guessed.
+
+Three of those five were found by a script whose own output was the giveaway: a
+"no definition" verdict that contradicted a plain reading of the file. The
+pattern is the same one that has run through this project repeatedly -- an empty
+or negative result from a tool gets read as a fact about the device. The
 measurements that decided the bootloop all had the same risk, and the ones that
 mattered were checked in both directions.
 
