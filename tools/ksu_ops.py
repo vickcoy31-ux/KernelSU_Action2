@@ -270,3 +270,109 @@ def prune_backups(dest_dir, keep=20):
 def copy_local(src, dst):
     shutil.copyfile(src, dst)
     return dst
+
+
+# ------------------------------------------------------------------ sulog ---
+
+# The su log is not binary. A hex dump of 586213 bytes from a real tablet found
+# zero non-printable bytes across the whole file: one record per line, each a run
+# of key=value pairs, values quoted only when they contain spaces. Splitting on
+# whitespace would invent keys, because an argv like "su -c sh if=x" contains
+# "if=" in the middle of a quoted string.
+#
+# The alternative to this -- decoding a frame protocol the way ksud does for its
+# socket -- was a guess from the strings in the binary and would have been wrong.
+# The file format was read off the bytes instead.
+
+SULOG_FIELD = re.compile(r'([a-z_][a-z0-9_]*)=("(?:[^"\\]|\\.)*"|[^\s]*)')
+SULOG_TYPES = {
+    'daemon_start': 'daemon sulogd mulai',
+    'root_execve': 'root_execve',
+    'ioctl_grant_root': 'ioctl_grant_root',
+    'sucompat': 'sucompat',
+}
+
+
+def parse_sulog(text):
+    """Text of a sulog log -> list of records, oldest first.
+
+    Each record keeps every field the line carried. Nothing is dropped, because a
+    log that quietly loses a field is worse than no log.
+    """
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or '=' not in line:
+            continue
+        rec = {}
+        for k, v in SULOG_FIELD.findall(line):
+            if v.startswith('"') and v.endswith('"') and len(v) >= 2:
+                v = v[1:-1]
+                # The writer escapes " and \ inside quoted values; unescape only
+                # those two, so a stray backslash in a path survives.
+                v = v.replace('\\"', '"').replace('\\\\', '\\')
+            rec[k] = v
+        if not rec:
+            continue
+        out.append(rec)
+    return out
+
+
+def sulog_summary(records):
+    """Counts per type and the distinct uids seen. Cheap, for the header."""
+    counts = {}
+    uids = set()
+    for r in records:
+        t = r.get('type', '?')
+        counts[t] = counts.get(t, 0) + 1
+        if r.get('uid'):
+            uids.add(r['uid'])
+    return {'total': len(records), 'counts': counts,
+            'uids': sorted(uids, key=lambda x: int(x) if str(x).isdigit() else 0)}
+
+
+def sulog_elapsed(ts_ns):
+    """Format the ts_ns field as time since boot, or '' when absent.
+
+    ts_ns is a monotonic timestamp, not a wall clock. The first record in a real
+    log reads ts_ns=8181804999, which is eight seconds after boot; treated as an
+    epoch it becomes 1970-01-01, and a log of root requests dated in 1970 is
+    worse than no log because it looks authoritative. Uptime since boot is what
+    the number actually means, so that is what gets shown.
+    """
+    if ts_ns in (None, ''):
+        return ''
+    try:
+        ns = int(ts_ns)
+    except (TypeError, ValueError):
+        return ''
+    if ns < 0:
+        return ''
+    s = ns // 1_000_000_000
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f'{d}d {h}h {m:02d}m {sec:02d}s'
+    if h:
+        return f'{h}:{m:02d}:{sec:02d}'
+    return f'{m}:{sec:02d}'
+
+
+# Kept under its old name because the first version of this module used it and
+# returning a wrong wall-clock time from it is the bug being fixed here.
+sulog_time = sulog_elapsed
+
+
+def sulog_describe(rec):
+    """One line a person can read, without hiding the raw fields."""
+    t = rec.get('type', '')
+    if t == 'daemon_start':
+        return f"daemon mulai, boot_id {rec.get('boot_id', '?')}"
+    what = rec.get('comm') or rec.get('file') or '?'
+    argv = rec.get('argv', '')
+    uid = rec.get('uid', '-')
+    base = f'{what} (uid {uid})'
+    if argv:
+        base += f'  {argv[:110]}'
+    return base

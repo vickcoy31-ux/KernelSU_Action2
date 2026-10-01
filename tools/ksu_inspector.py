@@ -360,6 +360,23 @@ def collect(dev, tmpdir):
             files.append({'name': f[-1], 'size': f[4], 'modified': ' '.join(f[5:7])})
     data['logs'] = files
 
+    # The su log is the one thing here worth reading in full, so it is pulled and
+    # parsed rather than summarised by size. Newest file by name, since the names
+    # sort chronologically: sulog-YYYY-MM-DD.log.
+    sulogs = [f for f in files if f['name'].startswith('sulog-')]
+    data['sulog'] = []
+    data['sulog_file'] = None
+    if sulogs:
+        newest = sorted(sulogs, key=lambda x: x['name'])[-1]
+        got = dev.pull(f"{KSU_DIR}/log/{newest['name']}", os.path.join(tmpdir, 'sulog.log'))
+        if got:
+            with open(got, encoding='ascii', errors='replace') as fh:
+                data['sulog'] = ksu_ops.parse_sulog(fh.read())
+            data['sulog_summary'] = ksu_ops.sulog_summary(data['sulog'])
+            data['sulog_file'] = newest
+        else:
+            note('sulog', 'gagal mengambil ' + newest['name'])
+
     ok, out = dev.su(f'ls {KSU_DIR}/profile/templates/')
     # ls of a directory lists . and .. too, and those are not templates.
     data['templates'] = [t for t in out.split() if t not in ('.', '..')]
@@ -383,75 +400,231 @@ def _json_list(text):
 
 # ------------------------------------------------------------------- GUI ----
 
+# Every colour below was read out of a screenshot of the manager app running on
+# this tablet, not chosen by eye: a histogram over the whole 800x1340 frame gave
+# the dominant tone of each surface.
+#
+#   #F6FAFE  page background       51.6% of the frame
+#   #EAEEF3  second surface        37.7%
+#   #C4E7FF  the blue status card   6.4%
+#   #1D6586  the accent used for section headings
+#   #004C69  the darker accent used for the built-in badge
+#   #181C1F  primary text
+#   #41484D  secondary text
+#   #ABAFB3  muted text
+#   #DFE3E7  hairline
+#   #EF2056  the red the app uses for errors
+#
+# The manager is a light theme, which is worth saying because light was not what
+# was expected of a root manager.
+BG, SURF, CARD = '#F6FAFE', '#EAEEF3', '#FFFFFF'
+BORDER, ACCENT, ACCENT_D = '#DFE3E7', '#1D6586', '#004C69'
+STATUS, STATUS_D = '#C4E7FF', '#0E4A66'
+TEXT, TEXT2, MUTED, DANGER = '#181C1F', '#41484D', '#ABAFB3', '#EF2056'
+
+FONT = 'Segoe UI'
+
+
+class Card(tk.Frame):
+    """A surface with a hairline border, holding whatever is put inside it.
+
+    This began as a canvas drawing a rounded rectangle with four arcs, which is
+    how the manager's cards look. It was dropped after it rendered as an empty
+    box: the canvas item is what gives the inner frame its height, so deriving
+    that height from the frame means waiting for an event only a nonzero height
+    would produce, and none ever arrives. Square corners that always show beat
+    rounded corners that sometimes do not.
+
+        Card(master, bg=CARD).body
+    """
+
+    def __init__(self, master, bg=CARD, pad=16, **kw):
+        super().__init__(master, bg=BORDER, bd=0, highlightthickness=1,
+                         highlightbackground=BORDER)
+        self.body = tk.Frame(self, bg=bg, padx=pad, pady=pad)
+        self.body.pack(fill='both', expand=True, padx=1, pady=1)
+        if kw:
+            self.body.configure(**kw)
+
+
+def pill(parent, text, command, bg=CARD, fg=TEXT2, padx=14, pady=7, **kw):
+    """A flat button that reads like the manager's navigation pill."""
+    opts = dict(relief='flat', bd=0, highlightthickness=1,
+                highlightbackground=BORDER, highlightcolor=BORDER,
+                activebackground=SURF, activeforeground=TEXT,
+                bg=bg, fg=fg, font=(FONT, 10, 'bold'),
+                padx=padx, pady=pady, cursor='hand2')
+    opts.update(kw)
+    return tk.Button(parent, text=text, command=command, **opts)
+
+
 class App(tk.Tk):
+    TABS = ('Ringkasan', 'Fitur Kernel', 'Aplikasi Root', 'Riwayat root',
+            'Modul & Umount', 'Ubah (tulis)')
+
     def __init__(self):
         super().__init__()
-        self.title('KSU Inspector  -  baca dan ubah status KernelSU / ReSukiSU')
-        self.geometry('1000x760')
+        self.title('ReSukiSU  -  Status & Pengaturan')
+        self.geometry('1060x840')
+        self.configure(bg=BG)
         self.data = None
         self.adb = None
         self.dev = None
         self.write = None
+        self.sulog_all = []
+        self.sulog_filter = None
+        self._pages = {}
+        self._pills = {}
 
-        top = ttk.Frame(self, padding=8)
-        top.pack(fill='x')
-        ttk.Label(top, text='adb:').pack(side='left')
-        self.lbl_adb = ttk.Label(top, text='(belum dicari)')
-        self.lbl_adb.pack(side='left', padx=6)
-        ttk.Button(top, text='Cari adb', command=self.find_adb).pack(side='left')
-        self.btn_scan = ttk.Button(top, text='Baca tablet', command=self.scan, state='disabled')
-        self.btn_scan.pack(side='left', padx=12)
-        ttk.Button(top, text='Ekspor JSON', command=self.export_json, state='disabled')
-        self.btn_scan.master.winfo_children()[-1].pack(side='left')
-        ttk.Button(top, text='Simpan laporan HTML', command=self.export_html,
-                   state='disabled').pack(side='left', padx=6)
-        self._export_buttons = (top.winfo_children()[-1], top.winfo_children()[-2])
-
-        self.lbl_status = ttk.Label(self, text='Colok tablet, lalu tekan "Baca tablet".',
-                                    padding=(8, 0))
-        self.lbl_status.pack(fill='x')
-
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill='both', expand=True, padx=8, pady=8)
-        self.trees = {}
-        for name in ('Ringkasan', 'Fitur Kernel', 'Aplikasi Root',
-                     'Modul & Umount', 'Log & Profile'):
-            f = ttk.Frame(self.nb)
-            self.nb.add(f, text=name)
-            cols = ('a', 'b', 'c')
-            t = ttk.Treeview(f, columns=cols, show='headings', height=20)
-            for c, h, w in zip(cols, ('Item', 'Nilai', 'Keterangan'), (280, 200, 420)):
-                t.heading(c, text=h)
-                t.column(c, width=w)
-            sb = ttk.Scrollbar(f, orient='vertical', command=t.yview)
-            t.configure(yscrollcommand=sb.set)
-            t.pack(side='left', fill='both', expand=True)
-            sb.pack(side='right', fill='y')
-            self.trees[name] = t
-
-        self.nb_write = ttk.Frame(self.nb)
-        self.nb.add(self.nb_write, text='Ubah (tulis)')
-
-        self.txt = tk.Text(self, height=6, wrap='none')
-        self.txt.pack(fill='x', padx=8, pady=(0, 8))
-
+        self._build()
         self.after(200, self.find_adb)
 
+    # -- chrome -------------------------------------------------------------
+    def _build(self):
+        head = tk.Frame(self, bg=BG)
+        head.pack(fill='x', padx=20, pady=(18, 10))
+        tk.Label(head, text='ReSukiSU', bg=BG, fg=TEXT,
+                 font=(FONT, 26, 'bold')).pack(side='left')
+        right = tk.Frame(head, bg=BG)
+        right.pack(side='right')
+        self.lbl_adb = tk.Label(right, text='(mencari adb)', bg=BG, fg=MUTED,
+                                font=(FONT, 9), anchor='e')
+        self.lbl_adb.pack(fill='x')
+        self.btn_scan = pill(right, 'Baca tablet', self.scan, bg=ACCENT, fg='#FFFFFF',
+                             highlightbackground=ACCENT, activebackground=ACCENT_D,
+                             activeforeground='#FFFFFF')
+        self.btn_scan.pack(anchor='e', pady=(4, 0))
+
+        self.status = Card(self, bg=STATUS, pad=18)
+        self.status.pack(fill='x', padx=20, pady=(0, 12))
+        self.lbl_status_big = tk.Label(self.status.body, text='Belum dibaca', bg=STATUS,
+                                       fg=STATUS_D, font=(FONT, 14, 'bold'), anchor='w')
+        self.lbl_status_big.pack(fill='x')
+        self.lbl_status_sub = tk.Label(self.status.body,
+                                       text='Colok tablet, lalu tekan "Baca tablet".',
+                                       bg=STATUS, fg=STATUS_D, font=(FONT, 10), anchor='w',
+                                       justify='left')
+        self.lbl_status_sub.pack(fill='x')
+
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill='x', padx=20, pady=(0, 8))
+        for name in self.TABS:
+            b = pill(bar, name, lambda n=name: self.show(n))
+            b.pack(side='left', padx=(0, 6))
+            self._pills[name] = b
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill='both', expand=True, padx=20, pady=(0, 10))
+        # The pages have to be created with body as their parent. Created on the
+        # window and then placed into body, Tk lays them out against a master
+        # they are not children of: body ends up as tall as the whole window and
+        # covers the header, the status card and the tab bar.
+        for name in self.TABS:
+            self._pages[name] = tk.Frame(body, bg=BG)
+        self.nb_write = self._pages['Ubah (tulis)']
+        for name, f in self._pages.items():
+            if name != 'Ubah (tulis)':
+                self._build_page(name, f)
+
+        self.txt = tk.Text(self, height=5, bg=SURF, fg=TEXT2, relief='flat',
+                           font=(FONT, 9), padx=10, pady=6)
+        self.txt.pack(fill='x', padx=20, pady=(0, 12))
+
+        self.show('Ringkasan')
+
+    def _build_page(self, name, f):
+        if name == 'Ringkasan':
+            self.pg_summary = tk.Frame(f, bg=BG)
+            self.pg_summary.pack(fill='both', expand=True)
+            self.lbl_kernel = tk.Label(self.pg_summary, text='', bg=BG, fg=TEXT2,
+                                       font=(FONT, 10), anchor='w', justify='left')
+            self.lbl_kernel.pack(fill='x')
+            self.cards = tk.Frame(self.pg_summary, bg=BG)
+            self.cards.pack(fill='both', expand=True, pady=(10, 0))
+            self.summary_cards = []
+        elif name == 'Riwayat root':
+            top = tk.Frame(f, bg=BG)
+            top.pack(fill='x', pady=(0, 6))
+            self.sulog_info = tk.Label(top, text='', bg=BG, fg=TEXT2, font=(FONT, 9),
+                                       anchor='w')
+            self.sulog_info.pack(fill='x')
+            ent = tk.Frame(top, bg=BG)
+            ent.pack(fill='x', pady=(6, 0))
+            self.e_sulog = tk.Entry(ent, bg=CARD, fg=TEXT, relief='flat',
+                                    highlightthickness=1, highlightbackground=BORDER,
+                                    font=(FONT, 10))
+            self.e_sulog.pack(side='left', fill='x', expand=True, ipady=4)
+            self.e_sulog.bind('<Return>', lambda e: self.fill_sulog())
+            pill(ent, 'Saring', self.fill_sulog).pack(side='left', padx=(8, 0))
+            types = tk.Frame(top, bg=BG)
+            types.pack(fill='x', pady=(6, 0))
+            self.sulog_types = {}
+            for t in ('semua', 'sucompat', 'ioctl_grant_root', 'root_execve', 'daemon_start'):
+                b = pill(types, t, lambda x=t: self.filter_sulog(x), padx=10, pady=4)
+                b.pack(side='left', padx=(0, 4))
+                self.sulog_types[t] = b
+            self.t_sulog = self._tree(f, (('Waktu', 90), ('Tipe', 150), ('Proses', 150),
+                                         ('UID', 70), ('Perintah', 520)))
+        else:
+            self.t_pages = getattr(self, 't_pages', {})
+            cols = {'Fitur Kernel': (('Fitur', 200), ('Nilai', 70), ('Keterangan', 620)),
+                    'Aplikasi Root': (('Paket', 260), ('UID', 90), ('SELinux', 200)),
+                    'Modul & Umount': (('Item', 260), ('Nilai', 200), ('Keterangan', 420))}[name]
+            self.t_pages[name] = self._tree(f, cols)
+
+    def _tree(self, parent, cols):
+        wrap = tk.Frame(parent, bg=CARD)
+        wrap.pack(fill='both', expand=True)
+        names = [c[0] for c in cols]
+        t = ttk.Treeview(wrap, columns=names, show='headings', height=18)
+        style = ttk.Style(self)
+        style.theme_use('clam')
+        # A new ttk style name has no layout until it inherits one; configure()
+        # on its own leaves Tk reporting "Layout KSU.Tree not found".
+        style.layout('KSU.Tree', style.layout('Treeview'))
+        style.layout('KSU.Tree.Heading', style.layout('Treeview.Heading'))
+        style.configure('KSU.Tree', background=CARD, fieldbackground=CARD,
+                        foreground=TEXT, borderwidth=0, rowheight=26, font=(FONT, 10))
+        style.map('KSU.Tree', background=[('selected', ACCENT)],
+                  foreground=[('selected', '#FFFFFF')])
+        style.configure('KSU.Tree.Heading', background=SURF, foreground=TEXT2,
+                        relief='flat', font=(FONT, 10, 'bold'))
+        style.map('KSU.Tree.Heading', background=[('active', SURF)])
+        t.configure(style='KSU.Tree')
+        for n, (h, w) in zip(names, cols):
+            t.heading(n, text=h)
+            t.column(n, width=w, anchor='w', stretch=(n == names[-1]))
+        sb = ttk.Scrollbar(wrap, orient='vertical', command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        t.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        return t
+
+    def show(self, name):
+        for n, f in self._pages.items():
+            if n != 'Ubah (tulis)':
+                f.place_forget()
+        self._pages[name].place(relwidth=1, relheight=1)
+        for n, b in self._pills.items():
+            on = (n == name)
+            b.configure(bg=ACCENT if on else CARD,
+                        fg='#FFFFFF' if on else TEXT2,
+                        highlightbackground=ACCENT if on else BORDER,
+                        activebackground=ACCENT_D if on else SURF,
+                        activeforeground='#FFFFFF' if on else TEXT)
+
+    # -- adb ----------------------------------------------------------------
     def find_adb(self):
-        self.lbl_status.config(text='Mencari adb...')
         self.adb = find_adb()
         if self.adb:
             self.lbl_adb.config(text=self.adb)
-            self.btn_scan.config(state='normal')
-            self.lbl_status.config(text='adb ditemukan. Tekan "Baca tablet".')
+            self.lbl_status_sub.config(text='adb ditemukan. Tekan "Baca tablet".')
         else:
-            self.lbl_adb.config(text='TIDAK DITEMUKAN')
-            self.lbl_status.config(
-                text='adb tidak ditemukan. Pasang platform-tools, atau edit ADB_CANDIDATES.')
+            self.lbl_adb.config(text='adb TIDAK ditemukan')
+            self.lbl_status_sub.config(text='Pasang Android platform-tools, lalu jalankan ulang.')
 
     def scan(self):
-        self.btn_scan.config(state='disabled')
-        self.lbl_status.config(text='Membaca...')
+        self.btn_scan.config(state='disabled', bg=SURF, fg=MUTED)
+        self.lbl_status_big.config(text='Membaca tablet...')
         threading.Thread(target=self._scan, daemon=True).start()
 
     def _scan(self):
@@ -460,100 +633,166 @@ class App(tk.Tk):
         try:
             devs = [l.split('\t')[0] for l in subprocess.run(
                 [self.adb, 'devices'], capture_output=True, text=True,
-                timeout=30).stdout.splitlines()
-                if '\tdevice' in l]
+                timeout=30).stdout.splitlines() if '\tdevice' in l]
             if not devs:
-                self.after(0, lambda: self.lbl_status.config(
-                    text='Tidak ada tablet terdeteksi. Cek kabel USB dan "USB debugging".'))
+                self.after(0, lambda: self.lbl_status_big.config(text='Tablet tidak terdeteksi'))
+                self.after(0, lambda: self.lbl_status_sub.config(
+                    text='Cek kabel USB dan izinkan "USB debugging" di tablet.'))
                 return
             self.dev = Device(self.adb, devs[0])
             data = collect(self.dev, tmp)
             self.after(0, lambda: self.render(data))
-        except Exception as e:                                   # noqa: BLE001
-            self.after(0, lambda: self.lbl_status.config(text=f'Gagal: {e}'))
+        except Exception as e:                                    # noqa: BLE001
+            self.after(0, lambda: self.lbl_status_big.config(text=f'Gagal: {e}'))
         finally:
-            self.after(0, lambda: self.btn_scan.config(state='normal'))
+            self.after(0, lambda: self.btn_scan.config(
+                state='normal', bg=ACCENT, fg='#FFFFFF'))
 
     # -- rendering ----------------------------------------------------------
-    def _fill(self, tab, rows):
-        t = self.trees[tab]
+    def _fill(self, t, rows):
         t.delete(*t.get_children())
         for r in rows:
-            t.insert('', 'end', values=[str(x) if x is not None else '' for x in r])
+            t.insert('', 'end', values=[('' if x is None else str(x)) for x in r])
 
     def render(self, d):
         self.data = d
-        for b in self._export_buttons:
-            b.config(state='normal')
-
         warn = ''
         if not d.get('root'):
-            warn = '  (TIDAK ADA ROOT -- sebagian data tidak bisa dibaca)'
+            warn = '  (TIDAK ADA ROOT -- sebagian data tidak terbaca)'
         if d.get('errors'):
             warn += '  ' + '; '.join(d['errors'][:2])
-        self.lbl_status.config(text=f"Device {d['serial']}{warn}")
 
-        self._fill('Ringkasan', [
-            ('Model', d.get('model', '?'), ''),
-            ('Android', d.get('android', '?'), ''),
-            ('Kernel', d.get('kernel', '?'), ''),
-            ('ksud', d.get('ksud', '?'), 'versi userspace'),
-            ('root', 'ya' if d.get('root') else 'tidak', d.get('root_line', '')),
-            ('Boot info', ' | '.join(d.get('boot_info', [])), ''),
-            ('Paket diperiksa', d.get('packages_scanned', 0), 'total paket terpasang'),
-        ] + [('Manager ' + m['package'], m['versionName'], 'versionCode ' + m['versionCode'])
-             for m in d.get('managers', [])])
+        if d.get('root'):
+            mgr = (d.get('managers') or [{}])[0]
+            self.lbl_status_big.config(text='Berfungsi      Built-in')
+            self.lbl_status_sub.config(
+                text=f"SuperUser: {len(d.get('allowlist', []))}, "
+                     f"Modul: {len(d.get('modules', []))}"
+                     f"     Manajer {mgr.get('package', '?')} {mgr.get('versionName', '?')}"
+                     + warn)
+        else:
+            self.lbl_status_big.config(text='Root tidak tersedia')
+            self.lbl_status_sub.config(text=warn or 'tablet tidak merespons su')
 
-        self._fill('Fitur Kernel',
-                   [(f["name"], f"{f['state']} ({f['value']})", f['description'])
-                    for f in d.get('features', [])])
+        self.lbl_kernel.config(
+            text=f"Kernel   {d.get('kernel', '?')}\n"
+                 f"Model    {d.get('model', '?')}      Android {d.get('android', '?')}"
+                 f"      ksud {d.get('ksud', '?')}")
 
-        self._fill('Aplikasi Root',
-                   [(a['package'], f"uid {a['uid']}", a['selinux'])
-                    for a in d.get('allowlist', [])]
-                   + [('(catatan)', d.get('allowlist_note', ''), '')])
+        for c in self.summary_cards:
+            c.destroy()
+        self.summary_cards = []
+        groups = [
+            ('Info versi', [
+                ('Versi Kernel', (d.get('kernel', '').split(' ')[2]
+                                  if len(d.get('kernel', '').split(' ')) > 2 else '-')),
+                ('Versi Android', d.get('android', '?')),
+                ('Versi driver kernel', d.get('driver_version', 'tidak terbaca')),
+                ('Versi Manajer', ' '.join(f"{m['versionName']} ({m['versionCode']})"
+                                           for m in d.get('managers', [])) or '?'),
+                ('Slot boot', ' | '.join(d.get('boot_info', [])) or '-')]),
+            ('Info status', [
+                ('Status SELinux', d.get('selinux', '-')),
+                ('Akses root', 'uid=0 lewat adb' if d.get('root') else 'tidak ada'),
+                ('Paket terpasang', str(d.get('packages_scanned', 0))),
+                ('Modul terpasang', str(len(d.get('modules', [])))),
+                ('Aturan umount', str(len(d.get('umount', []))))]),
+            ('Info log', [
+                ('Berkas su log', (d.get('sulog_file') or {}).get('name', 'tidak ada')),
+                ('Jumlah record', str(d.get('sulog_summary', {}).get('total', 0))),
+                ('Jenis', ', '.join(f'{k} {v}' for k, v in sorted(
+                    d.get('sulog_summary', {}).get('counts', {}).items(),
+                    key=lambda x: -x[1])) or '-'),
+                ('UID yang terlihat', ', '.join(
+                    d.get('sulog_summary', {}).get('uids', [])) or '-')]),
+        ]
+        for title, rows in groups:
+            card = Card(self.cards, pad=14)
+            card.pack(fill='x', pady=(0, 10))
+            self.summary_cards.append(card)
+            tk.Label(card.body, text=title, bg=CARD, fg=ACCENT,
+                     font=(FONT, 11, 'bold'), anchor='w').pack(fill='x', pady=(0, 8))
+            for k, v in rows:
+                row = tk.Frame(card.body, bg=CARD)
+                row.pack(fill='x', pady=1)
+                tk.Label(row, text=k, bg=CARD, fg=TEXT, font=(FONT, 10, 'bold'),
+                         anchor='w', width=22).pack(side='left')
+                tk.Label(row, text=v, bg=CARD, fg=TEXT2, font=(FONT, 10),
+                         anchor='w').pack(side='left', fill='x', expand=True)
+
+        self._fill(self.t_pages['Fitur Kernel'],
+                   [(f['name'], f['value'], f['description']) for f in d.get('features', [])])
+        self._fill(self.t_pages['Aplikasi Root'],
+                   [(a['package'], a['uid'], a['selinux']) for a in d.get('allowlist', [])])
 
         rows = [('Modul', str(m), '') for m in d.get('modules', [])]
         rows += [('Umount rule', str(m), '') for m in d.get('umount', [])]
-        rows += [('.umount file', d.get('umount_file', ''), '')]
-        if not rows:
-            rows = [('(tidak ada)', '', '')]
-        self._fill('Modul & Umount', rows)
+        if d.get('umount_file'):
+            rows.append(('.umount', ' '.join(d['umount_file'].split())[:70], ''))
+        rows.append(('Catatan allowlist', d.get('allowlist_note', ''), ''))
+        rows += [(f"Log {l['name']}", l['size'] + ' B', l['modified']) for l in d.get('logs', [])]
+        rows += [('Template ' + t, '', '') for t in d.get('templates', [])]
+        self._fill(self.t_pages['Modul & Umount'], rows)
 
-        rows = [('Log ' + l['name'], l['size'] + ' B', l['modified'])
-                for l in d.get('logs', [])]
-        rows += [('Template profile', t, '') for t in d.get('templates', [])]
-        self._fill('Log & Profile', rows or [('(tidak ada)', '', '')])
+        sf = d.get('sulog_file') or {}
+        self.sulog_info.config(
+            text=f"{sf.get('name', 'tidak ada')}   ·   "
+                 f"{d.get('sulog_summary', {}).get('total', 0)} record"
+                 f"   ·   waktu dihitung sejak boot, bukan jam dinding")
+        self.sulog_all = list(d.get('sulog', []))
+        self.sulog_filter = None
+        self.e_sulog.delete(0, 'end')
+        self.fill_sulog()
 
         self.txt.delete('1.0', 'end')
         for e in d.get('errors', []):
             self.txt.insert('end', 'PERINGATAN: ' + e + '\n')
-        self.txt.insert(
-            'end',
-            'Tab "Ubah (tulis)" bisa mengubah tablet. Setiap tulisan: dicek dulu, '
-            'di-backup otomatis, minta konfirmasi, lalu diverifikasi setelah tulis.\n'
-            f'Folder backup: {BACKUP_DIR}\n')
+        self.txt.insert('end',
+                        'Tab "Ubah (tulis)" mengubah tablet: dicek, backup otomatis, '
+                        'konfirmasi, lalu diverifikasi.\n'
+                        f'Backup: {BACKUP_DIR}\n')
 
         if self.write is None:
             self.write = WriteTab(self, self.nb_write)
-        self.write.t_feat.delete(*self.write.t_feat.get_children())
+        w = self.write
+        w.t_feat.delete(*w.t_feat.get_children())
         for f in d.get('features', []):
-            self.write.t_feat.insert('', 'end', values=(f['name'], f'{f["value"]}',
-                                                        f['description']))
-        self.write.lb_umount.delete(0, 'end')
+            w.t_feat.insert('', 'end', values=(f['name'], f['value'], f['description']))
+        w.lb_umount.delete(0, 'end')
         for m in d.get('umount', []):
-            self.write.lb_umount.insert('end', m if isinstance(m, str) else str(m))
+            w.lb_umount.insert('end', m if isinstance(m, str) else str(m))
         ids = d.get('templates', [])
-        self.write.cb_tmpl['values'] = ids
-        if ids and not self.write.cb_tmpl.get():
-            self.write.cb_tmpl.current(0)
-        self.write.lb_allow.delete(0, 'end')
+        w.cb_tmpl['values'] = ids
+        if ids and not w.cb_tmpl.get():
+            w.cb_tmpl.current(0)
+        w.lb_allow.delete(0, 'end')
         for a in d.get('allowlist', []):
-            self.write.lb_allow.insert('end', f"{a['package']:<32} uid={a['uid']}  {a['selinux']}")
-        self.write.refresh_backups()
+            w.lb_allow.insert('end', f"{a['package']:<30} uid={a['uid']}  {a['selinux']}")
+        w.refresh_backups()
+
+    # -- sulog --------------------------------------------------------------
+    def filter_sulog(self, t):
+        self.sulog_filter = None if t == 'semua' else t
+        self.fill_sulog()
+
+    def fill_sulog(self):
+        want = (self.e_sulog.get() or '').strip().lower()
+        rows = []
+        for r in reversed(self.sulog_all):                    # newest first
+            if self.sulog_filter and r.get('type') != self.sulog_filter:
+                continue
+            if want and want not in ' '.join(str(v) for v in r.values()).lower():
+                continue
+            rows.append((ksu_ops.sulog_elapsed(r.get('ts_ns')),
+                         r.get('type', ''),
+                         r.get('comm') or r.get('file') or '-',
+                         r.get('uid', '-'),
+                         r.get('argv') or r.get('file') or r.get('boot_id') or ''))
+            if len(rows) >= 1200:
+                break
+        self._fill(self.t_sulog, rows)
 
     def refresh_feature_state(self):
-        """Re-read the feature table so the value column is not stale."""
         if not self.dev or not self.write:
             return
         _, out = self.dev.su(f'{KSUD} feature list 2>&1')
@@ -565,7 +804,6 @@ class App(tk.Tk):
                 t.set(iid, 'val', str(feats[name]['value']))
 
     def reload_quiet(self):
-        """Re-read after a write so the read tabs show what actually happened."""
         if not self.dev:
             return
         tmp = os.path.join(os.environ.get('TEMP', '.'), 'ksu_inspector')
@@ -577,17 +815,7 @@ class App(tk.Tk):
             data = collect(self.dev, tmp)
             self.after(0, lambda: self.render(data))
         except Exception as e:                                    # noqa: BLE001
-            self.after(0, lambda: self.lbl_status.config(text=f'Gagal memuat ulang: {e}'))
-
-    # -- export -------------------------------------------------------------
-    def _save(self, data, name):
-        path = filedialog.asksaveasfilename(defaultextension=name.split('.')[-1],
-                                            initialfile=name, filetypes=[(name, '*')])
-        if not path:
-            return
-        with open(path, 'w', encoding='utf-8') as fh:
-            fh.write(data)
-        self.lbl_status.config(text=f'Tersimpan: {path}')
+            self.after(0, lambda: self.lbl_status_big.config(text=f'Gagal memuat ulang: {e}'))
 
     def export_json(self):
         if self.data:
@@ -596,6 +824,15 @@ class App(tk.Tk):
     def export_html(self):
         if self.data:
             self._save(html_report(self.data), 'ksu-report.html')
+
+    def _save(self, data, name):
+        path = filedialog.asksaveasfilename(defaultextension=name.split('.')[-1],
+                                            initialfile=name, filetypes=[(name, '*')])
+        if not path:
+            return
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(data)
+        self.lbl_status_sub.config(text=f'Tersimpan: {path}')
 
 
 def html_report(d):
