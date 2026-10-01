@@ -1,4 +1,92 @@
-# CRC check: the last unexplained thing
+# CRC check: the cause of the bootloop
+
+## Result
+
+The comparison was run and it answered the question.
+
+```
+simbol yang diminta tablet   : 2305
+simbol di Module.symvers kita: 17623
+ada di kedua sisi             : 2304
+CRC SAMA                      : 2299
+CRC BEDA                      : 5
+tidak ada di build kita       : 1        <-- __stack_chk_guard
+```
+
+`__stack_chk_guard` is demanded by 155 of the 202 stock modules, always with CRC
+`0x8f678b07`, and our build did not have it at all. Not a wrong CRC: absent. The
+string does not appear even once in the kernel image, so it is not a question of
+the export being trimmed after the fact.
+
+The chain, each link measured rather than inferred:
+
+**1. The module is refused.** `CONFIG_MODVERSIONS=y`, so `insmod` compares the
+CRC each module recorded against the running kernel. No `__stack_chk_guard`
+export means no match, and the module is rejected whole.
+
+**2. It is not an isolated driver.** 155 modules import it, including `cqhci`
+for UFS storage, `cfg80211`, `clk-common` and `bootprof`. Without `cqhci` there
+is no storage, so `init` has nothing to mount and the kernel dies with no panic,
+no pstore record and no `adbd` to catch. That is the whole observed symptom.
+
+**3. The definition and the export are both present.** In
+`arch/arm64/kernel/process.c`:
+
+```c
+#if defined(CONFIG_STACKPROTECTOR) && !defined(CONFIG_STACKPROTECTOR_PER_TASK)
+unsigned long __stack_chk_guard __ro_after_init;
+EXPORT_SYMBOL(__stack_chk_guard);
+#endif
+```
+
+**4. The whole block is conditional on `CONFIG_STACKPROTECTOR_PER_TASK`.**
+
+```
+config read off the tablet : the option is not present at all
+config from run 36788148559: CONFIG_STACKPROTECTOR_PER_TASK=y
+```
+
+Samsung's kernel has no such option, so the block compiles and its modules find
+the canary. This tree has the option, kconfig takes its default of `y`, the block
+is skipped, and the symbol disappears. The tablet's `uname -a` and every one of
+its 202 modules agree with the first behaviour.
+
+**5. The fix is one token.** `CONFIG_STACKPROTECTOR_PER_TASK=n` in
+`EXTRA_DEFCONFIG`, in `config/gta9_guard.env`.
+
+**The prediction is falsifiable.** The next build's `Module.symvers` must contain
+`__stack_chk_guard` with CRC `0x8f678b07`, and `scripts/crccheck.py compare`
+must report zero missing symbols. If it does not, this explanation is wrong and
+the bootloop is still unexplained.
+
+### Two corrections this forced
+
+Both were caught by reading instead of assuming, and both would have sent the
+next run the wrong way.
+
+**`lib/stackprotector.c` does not exist, anywhere.** It was the obvious guess for
+the home of `__stack_chk_guard`, and it is absent from this tree *and* from
+upstream v5.10. Writing that file from memory would have added a second definition
+and broken the build.
+
+**"0 differences in the config" was wrong.** An earlier comparison walked only
+the keys present in both files. A key absent from one side was silently skipped,
+and that is exactly the case here: `CONFIG_STACKPROTECTOR_PER_TASK` appears in
+one config and not the other. `scripts/configdiff.py` reports absent keys
+separately and reads `# CONFIG_X is not set` as an explicit `n`. Run properly it
+finds 21 value differences and 45 options present only in our build.
+
+### What is still different, and not addressed
+
+**Five CRC mismatches, not boot-critical.** `sync_file_create` (`mtk_sync.ko`) and
+the four cpufreq entry points (`blocktag`, `mtk_pbm`, `musb_boost`, `teeperf`,
+`mediatek-cpufreq-hw`). Same class of problem, prototype drift between this newer
+tree and Samsung's older one, worth the same treatment afterwards.
+
+**The compiler is not the one Samsung used.** The tablet's kernel reports
+`Android (7284624) clang version 12.0.5`; this tree builds with 16.0.6. It is the
+largest single difference between the two builds, no measurement points at it
+yet, and `DISABLE_LTO` has never been isolated either.
 
 ## The situation
 
