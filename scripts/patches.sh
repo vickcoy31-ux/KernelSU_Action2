@@ -110,25 +110,42 @@ susfs_apply() {
 
 	# 4. Tree-local corrections for this device's kernel.
 	#
-	# The gki-android12-5.10 patch assumes a vm_area_struct that has a
-	# vm_pad_start field, and reads the end address of a VMA through
-	# VMA_PAD_START(). That field and macro arrived with the
-	# CONFIG_ARCH_VMAP_STACK rework after 5.10; this tree has neither, so the
-	# build compiled every object and then failed to link:
+	# The gki-android12-5.10 patch reads the end address of a VMA through
+	# VMA_PAD_START(), which belongs to the CONFIG_ARCH_VMAP_STACK rework that
+	# landed after 5.10 and adds a vm_pad_start field to struct vm_area_struct.
+	# This tree has neither, so run 36837265931 compiled every object file and
+	# then failed to link:
 	#
 	#   ld.lld: error: undefined symbol: VMA_PAD_START
 	#
-	# Run 36837265931 is where that happened. The correction replaces the macro
-	# with vma->vm_end, which is what the unpatched show_map_vma a few lines
-	# above already uses, so the two branches then agree.
+	# vma->vm_end is the right replacement, not a guess: the unpatched
+	# show_map_vma in this same file already computes the end address that way,
+	# and susfs_patch_to_5.4.patch, written for non-GKI trees like this one,
+	# uses vma->vm_end at the same spot. For any VMA without padding, which is
+	# all of them here, the two are the same value.
 	#
-	# Idempotent like the rest of this file: already-applied is not an error.
-	local treefix
-	for treefix in "${REPO_ROOT}"/patches/gta9-susfs-*.patch; do
-		[ -f "$treefix" ] || continue
-		apply_patch "$treefix" 1 \
-			|| die "tree-local SUSFS correction failed: $(basename "$treefix")"
-	done
+	# This is a substitution on an exact string rather than a patch file. It was
+	# a patch file first, and that failed in run 36848575893 while passing every
+	# local check: patch(1) matches on surrounding context, and this file has two
+	# show_map_vma bodies after the SUSFS patch, so the line to replace is not
+	# uniquely anchored by position. A substitution does not care where the line
+	# ended up, and the assertion below means a silently missed correction is an
+	# error here rather than a link error forty minutes later.
+	local tmmc="${KERNEL_DIR}/fs/proc/task_mmu.c"
+	if [ -f "$tmmc" ] && grep -q 'VMA_PAD_START(vma)' "$tmmc"; then
+		local before after
+		before=$(grep -c 'VMA_PAD_START(vma)' "$tmmc")
+		sed -i 's/end = VMA_PAD_START(vma);/end = vma->vm_end;/g' "$tmmc"
+		after=$(grep -c 'VMA_PAD_START(vma)' "$tmmc" || true)
+		if [ "$after" != "0" ]; then
+			die "VMA_PAD_START correction did not apply.
+       ${before} occurrence(s) before, ${after} after. The file is
+       ${tmmc} and the expected text was 'end = VMA_PAD_START(vma);'."
+		fi
+		ok "fs/proc/task_mmu.c: VMA_PAD_START -> vma->vm_end (${before} occurrence)"
+	elif [ -f "$tmmc" ]; then
+		debug "fs/proc/task_mmu.c: no VMA_PAD_START to correct, already applied"
+	fi
 
 	# Record the SUSFS version for the build summary.
 	local sv
