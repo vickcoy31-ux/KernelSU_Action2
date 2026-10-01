@@ -167,6 +167,32 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
+      # Module.symvers is the file that decides whether a flash is worth trying.
+      # Every one of the tablet's 202 vendor modules records a CRC for each symbol
+      # it imports, taken from the tree it was built from, and insmod refuses a
+      # module whose CRC disagrees with the running kernel. That is how the second
+      # bootloop was found: 155 of them import __stack_chk_guard, it was absent,
+      # and cqhci went with them so init had no storage and died silently.
+      #
+      # scripts/crccheck.py compares that file against the CRCs read off the
+      # tablet, but the workflow did not upload it, so the check could only be run
+      # on a build whose artifacts happened to contain it. None did. The config,
+      # the image and the AnyKernel3 zip were uploaded and nothing else, which
+      # means the gate that catches a silent-boot failure was never available for
+      # the SUSFS builds even though those builds rewrite prototypes in 24 kernel
+      # files and can therefore shift a CRC on their own.
+      #
+      # Uploaded with the config because it belongs with it, and with
+      # if-no-files-found: error so a build that somehow lacks it is visible rather
+      # than quietly producing an uncheckable kernel.
+      - name: Upload Module.symvers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta9-symvers-${{ env.BUILD_TIME }}
+          path: kernel_workspace/android-kernel/out/Module.symvers
+          if-no-files-found: error
+
       - name: Package artifacts
         run: bash scripts/package.sh all
 
