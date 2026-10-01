@@ -55,7 +55,32 @@ ksu_registry() {
 		echo "https://github.com/SukiSU-Ultra/SukiSU-Ultra|main|KernelSU|main|builtin|builtin|SukiSU-Ultra" ;;
 	resukisu)
 		# Re-fork of SukiSU-Ultra aimed at legacy/non-GKI kernels.
-		echo "https://github.com/ReSukiSU/ReSukiSU|main|KernelSU|main|main|-|ReSukiSU" ;;
+		#
+		# The bundled-ref field used to be '-', which was wrong, and it was wrong
+		# in a way that broke SUSFS rather than enabling it. patches.sh reads it
+		# as:
+		#
+		#   [ "$bundled" = "-" ] && return 1
+		#
+		# so a '-' short-circuits susfs_is_bundled() before it ever looks at the
+		# tree. With ENABLE_SUSFS=true that sent susfs_apply() on to try
+		# 10_enable_susfs_for_ksu.patch, which targets SukiSU-Ultra's driver and
+		# does not fit this one; the build then died at "SUSFS integration failed"
+		# after the kernel-side patch had already applied cleanly. Run
+		# 36832621020, which is where that was seen.
+		#
+		# ReSukiSU main does declare SUSFS. Verified by fetching
+		# ReSukiSU/ReSukiSU/83850e8e/kernel/Kconfig, the exact commit run
+		# 36832621020 resolved to, and finding config KSU_SUSFS at line 104 with
+		# all ten CONFIG_KSU_SUSFS_* options below it. The driver also implements
+		# ksu_handle_susfs_cmd in kernel/supercall/dispatch.c and handles
+		# CMD_SUSFS_SHOW_VERSION, SHOW_VARIANT and SHOW_ENABLED_FEATURES there,
+		# which are the three commands ksud sends as 0x555e1/2/3.
+		#
+		# So the driver half is already present and the patch is not just
+		# unnecessary but harmful here. Listing 'main' makes susfs_is_bundled()
+		# fall through to the tree inspection and find the same answer.
+		echo "https://github.com/ReSukiSU/ReSukiSU|main|KernelSU|main|main|main|ReSukiSU" ;;
 	rsuntk)
 		echo "https://github.com/rsuntk/KernelSU|main|KernelSU|main|main|susfs-rksu-master|RKSU (rsuntk)" ;;
 	backslashxx)
